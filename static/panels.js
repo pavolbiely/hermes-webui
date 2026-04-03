@@ -668,17 +668,18 @@ async function switchToProfile(name) {
     // Refresh model dropdown (profile may have different provider/models)
     _skillsData = null;
     await populateModelDropdown();
-    // Apply profile's default model if provided
-    if (data.default_model && $('modelSelect')) {
-      $('modelSelect').value = data.default_model;
-      if ($('modelSelect').value !== data.default_model) {
-        // Model not in list — add it
-        const opt = document.createElement('option');
-        opt.value = data.default_model;
-        opt.textContent = data.default_model.split('/').pop();
-        $('modelSelect').insertBefore(opt, $('modelSelect').firstChild);
-        $('modelSelect').value = data.default_model;
+    // Apply profile's default model using the smart resolver (handles id mismatches
+    // like 'claude-sonnet-4-6' vs 'anthropic/claude-sonnet-4.6' in the dropdown)
+    if (data.default_model) {
+      const sel = $('modelSelect');
+      const resolved = _applyModelToDropdown(data.default_model, sel);
+      const modelToUse = resolved || data.default_model;
+      // Also update the current session's model so syncTopbar() doesn't fight us
+      if (S.session) {
+        S.session.model = modelToUse;
       }
+      // Store as pending so syncTopbar skips its model override on the next call
+      S._pendingProfileModel = modelToUse;
     }
     // Refresh workspace list (now profile-local)
     _workspaceList = null;

@@ -7,6 +7,38 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 // Dynamic model labels -- populated by populateModelDropdown(), fallback to static map
 let _dynamicModelLabels={};
 
+// ── Smart model resolver ────────────────────────────────────────────────────
+// Finds the best matching option value in a <select> for a given model ID.
+// Handles mismatches like 'claude-sonnet-4-6' vs 'anthropic/claude-sonnet-4.6'.
+// Returns the matched option's value (already in the list), or null if no match.
+function _findModelInDropdown(modelId, sel){
+  if(!modelId||!sel) return null;
+  const opts=Array.from(sel.options).map(o=>o.value);
+  // 1. Exact match
+  if(opts.includes(modelId)) return modelId;
+  // 2. Normalize: lowercase, strip namespace prefix, replace hyphens→dots
+  const norm=s=>s.toLowerCase().replace(/^[^/]+\//,'').replace(/-/g,'.');
+  const target=norm(modelId);
+  const exact=opts.find(o=>norm(o)===target);
+  if(exact) return exact;
+  // 3. Prefix/substring: target starts with or contains a significant chunk
+  const base=target.replace(/\.\d+$/,'');  // strip trailing version number
+  const partial=opts.find(o=>norm(o).startsWith(base)||norm(o).includes(base));
+  return partial||null;
+}
+
+// Set the model picker to the best match for modelId.
+// Returns the resolved value that was actually set, or null if nothing matched.
+function _applyModelToDropdown(modelId, sel){
+  if(!modelId||!sel) return null;
+  const resolved=_findModelInDropdown(modelId,sel);
+  if(resolved){
+    sel.value=resolved;
+    return resolved;
+  }
+  return null;
+}
+
 async function populateModelDropdown(){
   const sel=$('modelSelect');
   if(!sel) return;
@@ -30,15 +62,7 @@ async function populateModelDropdown(){
     }
     // Set default model from server if no localStorage preference
     if(data.default_model && !localStorage.getItem('hermes-webui-model')){
-      sel.value=data.default_model;
-      // If the default isn't in the list, add it
-      if(sel.value!==data.default_model){
-        const opt=document.createElement('option');
-        opt.value=data.default_model;
-        opt.textContent=data.default_model.split('/').pop();
-        sel.insertBefore(opt,sel.firstChild);
-        sel.value=data.default_model;
-      }
+      _applyModelToDropdown(data.default_model, sel);
     }
   }catch(e){
     // API unavailable -- keep the hardcoded HTML options as fallback
@@ -320,15 +344,23 @@ function syncTopbar(){
   document.title=sessionTitle+' \u2014 Hermes';
   const vis=S.messages.filter(m=>m&&m.role&&m.role!=='tool');
   $('topbarMeta').textContent=`${vis.length} messages`;
-  const m=S.session.model||'';
-  $('modelSelect').value=m;  // set dropdown first so chip reads consistent value
-  // If session model isn't in the dropdown, add it dynamically
-  if(m && $('modelSelect').value!==m){
-    const opt=document.createElement('option');
-    opt.value=m;
-    opt.textContent=getModelLabel(m);
-    $('modelSelect').appendChild(opt);
-    $('modelSelect').value=m;
+  // If a profile switch just happened, apply its model rather than the session's stale value.
+  // S._pendingProfileModel is set by switchToProfile() and cleared here after one application.
+  const modelOverride=S._pendingProfileModel;
+  if(modelOverride){
+    S._pendingProfileModel=null;
+    _applyModelToDropdown(modelOverride,$('modelSelect'));
+  } else {
+    const m=S.session.model||'';
+    const applied=_applyModelToDropdown(m,$('modelSelect'));
+    // If the model isn't in the list at all, add it so the session value is preserved
+    if(!applied && m){
+      const opt=document.createElement('option');
+      opt.value=m;
+      opt.textContent=getModelLabel(m);
+      $('modelSelect').appendChild(opt);
+      $('modelSelect').value=m;
+    }
   }
   // Show Clear button only when session has messages
   const clearBtn=$('btnClearConv');
