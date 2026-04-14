@@ -552,7 +552,7 @@ function renderMd(raw){
   // Autolink: convert plain URLs to clickable links.
   // Stash existing <a> tags first so we never re-link a URL already inside href="...".
   const _al_stash=[];
-  s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
+  s=s.replace(/(<a\b[^>]*>[\s\S]*?<\/a>|<img\b[^>]*>)/g,m=>{_al_stash.push(m);return `\x00B${_al_stash.length-1}\x00`;});
   s=s.replace(/(https?:\/\/[^\s<>"'\)\]]+)/g,(url)=>{
     // Strip trailing punctuation that was likely not part of the URL
     const trail=url.match(/[.,;:!?)]$/)?url.slice(-1):'';
