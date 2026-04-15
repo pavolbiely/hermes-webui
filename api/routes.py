@@ -214,6 +214,18 @@ except ImportError:
     _lock = threading.Lock()
     _permanent_approved = set()
 
+# Clarify prompts (optional -- graceful fallback if agent not available)
+try:
+    from api.clarify import (
+        submit_pending as submit_clarify_pending,
+        get_pending as get_clarify_pending,
+        resolve_clarify,
+    )
+except ImportError:
+    submit_clarify_pending = lambda *a, **k: None
+    get_clarify_pending = lambda *a, **k: None
+    resolve_clarify = lambda *a, **k: 0
+
 
 # ── Login page locale strings ─────────────────────────────────────────────────
 # Add entries here to support more languages on the login page.
@@ -603,6 +615,15 @@ def handle_get(handler, parsed) -> bool:
             return j(handler, {"error": "not found"}, status=404)
         return _handle_approval_inject(handler, parsed)
 
+    if parsed.path == "/api/clarify/pending":
+        return _handle_clarify_pending(handler, parsed)
+
+    if parsed.path == "/api/clarify/inject_test":
+        # Loopback-only: used by automated tests; blocked from any remote client
+        if handler.client_address[0] != "127.0.0.1":
+            return j(handler, {"error": "not found"}, status=404)
+        return _handle_clarify_inject(handler, parsed)
+
     # ── Cron API (GET) ──
     if parsed.path == "/api/crons":
         from cron.jobs import list_jobs
@@ -910,6 +931,10 @@ def handle_post(handler, parsed) -> bool:
     # ── Approval (POST) ──
     if parsed.path == "/api/approval/respond":
         return _handle_approval_respond(handler, body)
+
+    # ── Clarify (POST) ──
+    if parsed.path == "/api/clarify/respond":
+        return _handle_clarify_respond(handler, body)
 
     # ── Skills (POST) ──
     if parsed.path == "/api/skills/save":
@@ -1672,6 +1697,34 @@ def _handle_approval_inject(handler, parsed):
     return j(handler, {"error": "session_id required"}, status=400)
 
 
+def _handle_clarify_pending(handler, parsed):
+    sid = parse_qs(parsed.query).get("session_id", [""])[0]
+    pending = get_clarify_pending(sid)
+    if pending:
+        return j(handler, {"pending": pending})
+    return j(handler, {"pending": None})
+
+
+def _handle_clarify_inject(handler, parsed):
+    """Inject a fake pending clarify prompt -- loopback-only, used by automated tests."""
+    qs = parse_qs(parsed.query)
+    sid = qs.get("session_id", [""])[0]
+    question = qs.get("question", ["Which option?"])[0]
+    choices = qs.get("choices", [])
+    if sid:
+        submit_clarify_pending(
+            sid,
+            {
+                "question": question,
+                "choices_offered": choices,
+                "session_id": sid,
+                "kind": "clarify",
+            },
+        )
+        return j(handler, {"ok": True, "session_id": sid})
+    return j(handler, {"error": "session_id required"}, status=400)
+
+
 def _handle_live_models(handler, parsed):
     """Return the live model list for a provider.
 
@@ -1892,6 +1945,24 @@ def _handle_chat_start(handler, body):
     except ValueError as e:
         return bad(handler, str(e))
     model = body.get("model") or s.model
+    # Prevent duplicate runs in the same session while a stream is still active.
+    # This commonly happens after page refresh/reconnect races and can produce
+    # duplicated clarify cards for what appears to be a single user request.
+    current_stream_id = getattr(s, "active_stream_id", None)
+    if current_stream_id:
+        with STREAMS_LOCK:
+            current_active = current_stream_id in STREAMS
+        if current_active:
+            return j(
+                handler,
+                {
+                    "error": "session already has an active stream",
+                    "active_stream_id": current_stream_id,
+                },
+                status=409,
+            )
+        # Stale stream id from a previous run; clear and continue.
+        s.active_stream_id = None
     stream_id = uuid.uuid4().hex
     s.workspace = workspace
     s.model = model
@@ -2301,6 +2372,22 @@ def _handle_approval_respond(handler, body):
     # thread is parked in entry.event.wait() and needs to be woken up.
     resolve_gateway_approval(sid, choice, resolve_all=False)
     return j(handler, {"ok": True, "choice": choice})
+
+
+def _handle_clarify_respond(handler, body):
+    sid = body.get("session_id", "")
+    if not sid:
+        return bad(handler, "session_id is required")
+    response = body.get("response")
+    if response is None:
+        response = body.get("answer")
+    if response is None:
+        response = body.get("choice")
+    response = str(response or "").strip()
+    if not response:
+        return bad(handler, "response is required")
+    resolve_clarify(sid, response, resolve_all=False)
+    return j(handler, {"ok": True, "response": response})
 
 
 def _handle_skill_save(handler, body):

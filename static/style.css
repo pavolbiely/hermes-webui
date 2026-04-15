@@ -304,6 +304,30 @@
   .approval-btn.deny{border-color:rgba(233,69,96,0.5);color:var(--accent);}
   .approval-btn.deny:hover{background:rgba(233,69,96,0.12);border-color:rgba(233,69,96,0.7);}
   .approval-btn.loading{opacity:.7;cursor:wait;}
+  /* ── Clarify card ── */
+  .clarify-card{display:none;max-width:680px;margin:4px 0 2px 40px;padding:0;}
+  .clarify-card.visible{display:block;}
+  .clarify-inner{background:rgba(255,255,255,.03);backdrop-filter:blur(8px);border:1px solid rgba(124,185,255,0.16);border-radius:12px;padding:12px 14px 13px;box-shadow:0 1px 0 rgba(255,255,255,.02) inset;}
+  .clarify-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;font-weight:700;color:var(--blue);letter-spacing:.01em;}
+  .clarify-question{font-size:14px;color:var(--text);line-height:1.7;white-space:pre-wrap;margin-bottom:12px;}
+  .clarify-choices{display:flex;flex-direction:column;gap:8px;margin-bottom:12px;}
+  .clarify-choice{display:flex;align-items:flex-start;gap:10px;width:100%;padding:11px 14px;border-radius:12px;font-size:13px;font-weight:600;border:1px solid rgba(124,185,255,0.3);background:rgba(124,185,255,0.08);color:var(--blue);cursor:pointer;transition:all .15s;white-space:normal;text-align:left;box-shadow:0 1px 0 rgba(255,255,255,.03) inset;}
+  .clarify-choice:hover{background:rgba(124,185,255,0.16);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,0.18);}
+  .clarify-choice:focus-visible{outline:2px solid rgba(124,185,255,.75);outline-offset:2px;}
+  .clarify-choice-badge{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:24px;border-radius:999px;background:rgba(124,185,255,0.16);border:1px solid rgba(124,185,255,0.3);color:var(--blue);font-size:11px;font-weight:800;flex-shrink:0;line-height:1;}
+  .clarify-choice-badge.other{background:rgba(201,168,76,0.12);border-color:rgba(201,168,76,0.32);color:var(--gold);}
+  .clarify-choice-text{flex:1;line-height:1.45;min-width:0;}
+  .clarify-choice.other{border-color:rgba(201,168,76,0.35);color:var(--gold);background:rgba(201,168,76,0.08);}
+  .clarify-choice.other:hover{background:rgba(201,168,76,0.14);border-color:rgba(201,168,76,0.55);}
+  .clarify-response{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+  .clarify-input{flex:1;min-width:220px;padding:10px 12px;border-radius:8px;border:1px solid var(--border2);background:var(--input-bg);color:var(--text);font:inherit;outline:none;transition:all .15s;}
+  .clarify-input:focus{border-color:rgba(124,185,255,.5);box-shadow:0 0 0 3px rgba(124,185,255,.08);background:var(--hover-bg);}
+  .clarify-submit{display:inline-flex;align-items:center;justify-content:center;min-width:92px;padding:10px 14px;border-radius:8px;border:1px solid rgba(124,185,255,0.35);background:rgba(124,185,255,0.14);color:var(--blue);font-size:12px;font-weight:700;cursor:pointer;transition:all .15s;white-space:nowrap;}
+  .clarify-submit:hover{background:rgba(124,185,255,0.22);transform:translateY(-1px);}
+  .clarify-submit:disabled{opacity:.6;cursor:not-allowed;transform:none;}
+  .clarify-submit.loading{opacity:.75;cursor:wait;}
+  .clarify-hint{margin-top:8px;font-size:11px;line-height:1.45;color:var(--muted);}
+  .clarify-card.visible .clarify-question{padding-left:1px;}
   /* Sidebar navigation tabs */
   .sidebar-nav{display:flex;border-bottom:1px solid var(--border);flex-shrink:0;padding:6px 8px 0;gap:2px;}
   .nav-tab{flex:1;padding:10px 4px 8px;font-size:20px;text-align:center;cursor:pointer;color:var(--muted);border:none;background:none;transition:color .15s;border-bottom:2px solid transparent;white-space:nowrap;overflow:hidden;position:relative;}
@@ -691,6 +715,13 @@
     .approval-btns{gap:6px;}
     .approval-btn{padding:8px 12px;font-size:12px;min-height:44px;}
     .approval-kbd{display:none;}
+    /* Clarify card */
+    .clarify-card{margin:6px 0 4px 0;max-width:100%;}
+    .clarify-inner{padding:12px 12px 13px;}
+    .clarify-response{flex-direction:column;align-items:stretch;}
+    .clarify-input,.clarify-submit{width:100%;min-height:44px;}
+    .clarify-choice{min-height:44px;}
+    .clarify-choice-badge{min-width:22px;height:22px;}
     .app-dialog-overlay{padding:12px;}
     .app-dialog{width:100%;padding:16px 16px 14px;border-radius:16px;}
     .app-dialog-actions{flex-direction:column-reverse;align-items:stretch;}
@@ -825,6 +856,7 @@
 
 /* Approval buttons: tab stops */
 .approval-btn:focus{outline:2px solid var(--blue);outline-offset:2px;}
+.clarify-choice:focus,.clarify-submit:focus,.clarify-input:focus{outline:2px solid var(--blue);outline-offset:2px;}
 
 /* Message role: breathing room between icon and name */
 .msg-role > span{line-height:1;}

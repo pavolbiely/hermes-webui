@@ -44,6 +44,7 @@ async function send(){
     saveInflightState(activeSid,{streamId:null,messages:INFLIGHT[activeSid].messages,uploaded,toolCalls:[]});
   }
   startApprovalPolling(activeSid);
+  startClarifyPolling(activeSid);
   S.activeStreamId = null;  // will be set after stream starts
 
   // Set provisional title from user message immediately so session appears
@@ -79,12 +80,34 @@ async function send(){
     const cancelBtn=$('btnCancel');
     if(cancelBtn) cancelBtn.style.display='inline-flex';
   }catch(e){
+    const errMsg=String((e&&e.message)||'');
+    const conflictActiveStream=/session already has an active stream/i.test(errMsg);
+    if(conflictActiveStream){
+      delete INFLIGHT[activeSid];
+      if(typeof clearInflightState==='function') clearInflightState(activeSid);
+      stopApprovalPolling();
+      stopClarifyPolling();
+      // Keep the user's attempted turn by queueing it for after the current run.
+      queueSessionMessage(activeSid,{text:msgText,files:[]});
+      updateQueueBadge(activeSid);
+      showToast('Current session is still running. Reconnected and queued your message.',2600);
+      try{
+        await loadSession(activeSid);
+        setComposerStatus('');
+        return;
+      }catch(_){
+        // Fall through to standard error handling if session reload fails.
+      }
+    }
+
     delete INFLIGHT[activeSid];
     stopApprovalPolling();
+    stopClarifyPolling();
     // Only hide approval card if it belongs to the session that just finished
     if(!_approvalSessionId || _approvalSessionId===activeSid) hideApprovalCard(true);removeThinking();
-    S.messages.push({role:'assistant',content:`**Error:** ${e.message}`});
-    renderMessages();setBusy(false);setComposerStatus(`Error: ${e.message}`);
+    if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true);
+    S.messages.push({role:'assistant',content:`**Error:** ${errMsg}`});
+    renderMessages();setBusy(false);setComposerStatus(`Error: ${errMsg}`);
     return;
   }
 
@@ -290,6 +313,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('tool',e=>{
       const d=JSON.parse(e.data);
+      if(d.name==='clarify') return;
       const tc={name:d.name, preview:d.preview||'', args:d.args||{}, snippet:'', done:false, tid:d.tid||`live-${Date.now()}-${Math.random().toString(36).slice(2,8)}`};
       if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
       INFLIGHT[activeSid].toolCalls.push(tc);
@@ -305,6 +329,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('tool_complete',e=>{
       const d=JSON.parse(e.data);
+      if(d.name==='clarify') return;
       const inflight=INFLIGHT[activeSid];
       if(!inflight) return;
       if(!Array.isArray(inflight.toolCalls)) inflight.toolCalls=[];
@@ -340,13 +365,23 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       sendBrowserNotification('Approval required',d.description||'Tool approval needed');
     });
 
+    source.addEventListener('clarify',e=>{
+      const d=JSON.parse(e.data);
+      d._session_id=activeSid;
+      showClarifyCard(d);
+      playNotificationSound();
+      sendBrowserNotification('Clarification needed',d.question||'Tool clarification needed');
+    });
+
     source.addEventListener('done',e=>{
       source.close();
       const d=JSON.parse(e.data);
       delete INFLIGHT[activeSid];
       clearInflight();clearInflightState(activeSid);
       stopApprovalPolling();
+      stopClarifyPolling();
       if(!_approvalSessionId || _approvalSessionId===activeSid) hideApprovalCard(true);
+      if(!_clarifySessionId || _clarifySessionId===activeSid) hideClarifyCard(true);
       if(S.session&&S.session.session_id===activeSid){
         S.activeStreamId=null;
         const _cb=$('btnCancel');if(_cb)_cb.style.display='none';
@@ -396,8 +431,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // Application-level error sent explicitly by the server (rate limit, crash, etc.)
       // This is distinct from the SSE network 'error' event below.
       source.close();
-      delete INFLIGHT[activeSid];clearInflight();clearInflightState(activeSid);stopApprovalPolling();
+      delete INFLIGHT[activeSid];clearInflight();clearInflightState(activeSid);stopApprovalPolling();stopClarifyPolling();
       if(!_approvalSessionId||_approvalSessionId===activeSid) hideApprovalCard(true);
+      if(!_clarifySessionId||_clarifySessionId===activeSid) hideClarifyCard(true);
       if(S.session&&S.session.session_id===activeSid){
         S.activeStreamId=null;const _cbe=$('btnCancel');if(_cbe)_cbe.style.display='none';
         clearLiveToolCards();if(!assistantText)removeThinking();
@@ -457,8 +493,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('cancel',e=>{
       source.close();
-      delete INFLIGHT[activeSid];clearInflight();clearInflightState(activeSid);stopApprovalPolling();
+      delete INFLIGHT[activeSid];clearInflight();clearInflightState(activeSid);stopApprovalPolling();stopClarifyPolling();
       if(!_approvalSessionId||_approvalSessionId===activeSid) hideApprovalCard(true);
+      if(!_clarifySessionId||_clarifySessionId===activeSid) hideClarifyCard(true);
       if(S.session&&S.session.session_id===activeSid){
         S.activeStreamId=null;const _cbc=$('btnCancel');if(_cbc)_cbc.style.display='none';
       }
@@ -472,9 +509,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
 
   function _handleStreamError(){
-    delete INFLIGHT[activeSid];clearInflight();clearInflightState(activeSid);stopApprovalPolling();
+    delete INFLIGHT[activeSid];clearInflight();clearInflightState(activeSid);stopApprovalPolling();stopClarifyPolling();
     _closeSource();
     if(!_approvalSessionId||_approvalSessionId===activeSid) hideApprovalCard(true);
+    if(!_clarifySessionId||_clarifySessionId===activeSid) hideClarifyCard(true);
     if(S.session&&S.session.session_id===activeSid){
       S.activeStreamId=null;const _cbe=$('btnCancel');if(_cbe)_cbe.style.display='none';
       clearLiveToolCards();if(!assistantText)removeThinking();
@@ -620,6 +658,255 @@ function startApprovalPolling(sid) {
 
 function stopApprovalPolling() {
   if (_approvalPollTimer) { clearInterval(_approvalPollTimer); _approvalPollTimer = null; }
+}
+
+// ── Clarify polling ──
+let _clarifyPollTimer = null;
+let _clarifyHideTimer = null;
+let _clarifyVisibleSince = 0;
+let _clarifySignature = '';
+let _clarifySessionId = null;
+let _clarifyMissingEndpointWarned = false;
+const CLARIFY_MIN_VISIBLE_MS = 30000;
+
+function _ensureClarifyCardDom() {
+  let card = $("clarifyCard");
+  if (card) return card;
+  const host = $("msgInner") || $("messages");
+  if (!host) return null;
+  card = document.createElement("div");
+  card.className = "clarify-card";
+  card.id = "clarifyCard";
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-labelledby", "clarifyHeading");
+  card.setAttribute("aria-describedby", "clarifyQuestion clarifyHint");
+  card.innerHTML = `
+    <div class="clarify-inner">
+      <div class="clarify-header">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17h.01"/><path d="M9.09 9a3 3 0 1 1 5.82 1c0 2-3 2-3 4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span id="clarifyHeading" data-i18n="clarify_heading">Clarification needed</span>
+      </div>
+      <div class="clarify-question" id="clarifyQuestion"></div>
+      <div class="clarify-choices" id="clarifyChoices"></div>
+      <div class="clarify-response">
+        <input class="clarify-input" id="clarifyInput" type="text" data-i18n-placeholder="clarify_input_placeholder" placeholder="Type your response…">
+        <button class="clarify-submit" id="clarifySubmit" data-i18n="clarify_send">Send</button>
+      </div>
+      <div class="clarify-hint" id="clarifyHint" data-i18n="clarify_hint">Please choose one option, or type your own response below.</div>
+    </div>
+  `;
+  host.appendChild(card);
+  const submit = $("clarifySubmit");
+  if (submit) submit.onclick = () => respondClarify();
+  if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
+  return card;
+}
+
+function _clearClarifyHideTimer() {
+  if (_clarifyHideTimer) {
+    clearTimeout(_clarifyHideTimer);
+    _clarifyHideTimer = null;
+  }
+}
+
+function _resetClarifyCardState() {
+  _clearClarifyHideTimer();
+  _clarifyVisibleSince = 0;
+  _clarifySignature = '';
+}
+
+function hideClarifyCard(force=false) {
+  const card = $("clarifyCard");
+  if (!card) {
+    _clarifySessionId = null;
+    _resetClarifyCardState();
+    if (typeof unlockComposerForClarify === "function") unlockComposerForClarify();
+    return;
+  }
+  if (!force && _clarifyVisibleSince) {
+    const remaining = CLARIFY_MIN_VISIBLE_MS - (Date.now() - _clarifyVisibleSince);
+    if (remaining > 0) {
+      const scheduledSignature = _clarifySignature;
+      _clearClarifyHideTimer();
+      _clarifyHideTimer = setTimeout(() => {
+        _clarifyHideTimer = null;
+        if (_clarifySignature !== scheduledSignature) return;
+        hideClarifyCard(true);
+      }, remaining);
+      return;
+    }
+  }
+  _clarifySessionId = null;
+  _resetClarifyCardState();
+  card.classList.remove("visible");
+  if (typeof unlockComposerForClarify === "function") unlockComposerForClarify();
+  $("clarifyQuestion").textContent = "";
+  $("clarifyChoices").innerHTML = "";
+  $("clarifyInput").value = "";
+  $("clarifyInput").disabled = false;
+  $("clarifyInput").onkeydown = null;
+  const submit = $("clarifySubmit");
+  if (submit) { submit.disabled = false; submit.classList.remove("loading"); }
+}
+
+function _clarifySetControlsDisabled(disabled, loading=false) {
+  const input = $("clarifyInput");
+  const submit = $("clarifySubmit");
+  if (input) input.disabled = disabled;
+  if (submit) {
+    submit.disabled = disabled;
+    submit.classList.toggle("loading", !!loading);
+  }
+  const choices = $("clarifyChoices");
+  if (choices) {
+    choices.querySelectorAll("button").forEach(btn => {
+      btn.disabled = disabled;
+      if (loading && btn.dataset && btn.dataset.choice === "other") {
+        btn.classList.toggle("loading", false);
+      }
+    });
+  }
+}
+
+function showClarifyCard(pending) {
+  const question = pending.question || pending.description || '';
+  const choices = Array.isArray(pending.choices_offered)
+    ? pending.choices_offered
+    : (Array.isArray(pending.choices) ? pending.choices : []);
+  const sig = JSON.stringify({
+    question,
+    choices,
+    sid: pending._session_id || (S.session && S.session.session_id) || null,
+  });
+  const card = _ensureClarifyCardDom();
+  if (!card) return;
+  const questionEl = $("clarifyQuestion");
+  const choicesEl = $("clarifyChoices");
+  const input = $("clarifyInput");
+  const sameClarify = card.classList.contains("visible") && _clarifySignature === sig;
+  _clarifySessionId = pending._session_id || (S.session && S.session.session_id) || null;
+  _clarifySignature = sig;
+  if (!sameClarify) {
+    _clarifyVisibleSince = Date.now();
+    _clearClarifyHideTimer();
+  }
+  if (questionEl) questionEl.textContent = question;
+  if (choicesEl) {
+    choicesEl.innerHTML = '';
+    choicesEl.style.display = choices.length ? '' : 'none';
+    if (choices.length) {
+      choices.forEach((choice, idx) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'clarify-choice';
+        btn.dataset.choice = choice;
+        btn.onclick = () => respondClarify(choice);
+        const badge = document.createElement('span');
+        badge.className = 'clarify-choice-badge';
+        badge.textContent = String(idx + 1);
+        const text = document.createElement('span');
+        text.className = 'clarify-choice-text';
+        text.textContent = choice;
+        btn.appendChild(badge);
+        btn.appendChild(text);
+        choicesEl.appendChild(btn);
+      });
+      const other = document.createElement('button');
+      other.type = 'button';
+      other.className = 'clarify-choice other';
+      other.dataset.choice = 'other';
+      other.setAttribute('data-i18n', 'clarify_other');
+      const otherBadge = document.createElement('span');
+      otherBadge.className = 'clarify-choice-badge other';
+      otherBadge.textContent = '•';
+      const otherText = document.createElement('span');
+      otherText.className = 'clarify-choice-text';
+      otherText.textContent = t('clarify_other') || 'Other';
+      other.appendChild(otherBadge);
+      other.appendChild(otherText);
+      other.onclick = () => {
+        const el = $("clarifyInput");
+        if (el) {
+          el.focus();
+          if (typeof el.select === 'function') el.select();
+        }
+      };
+      choicesEl.appendChild(other);
+    }
+  }
+  if (input) {
+    if (!sameClarify) input.value = '';
+    input.disabled = false;
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        respondClarify();
+      }
+    };
+  }
+  if (typeof lockComposerForClarify === "function") {
+    lockComposerForClarify(question ? `Clarification needed: ${question}` : "Clarification needed");
+  }
+  _clarifySetControlsDisabled(false, false);
+  const msgInner = $("msgInner");
+  if (msgInner && card.parentElement !== msgInner) {
+    msgInner.appendChild(card);
+  }
+  card.classList.add("visible");
+  if (!sameClarify) card.scrollIntoView({block:"nearest", behavior:"smooth"});
+  if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
+  if (input && !sameClarify) setTimeout(() => input.focus(), 50);
+}
+
+async function respondClarify(response) {
+  const sid = _clarifySessionId || (S.session && S.session.session_id);
+  if (!sid) return;
+  const input = $("clarifyInput");
+  let value = typeof response === 'string' ? response : (input ? input.value : '');
+  value = String(value || '').trim();
+  if (!value) {
+    if (input) input.focus();
+    return;
+  }
+  _clarifySessionId = null;
+  _clarifySetControlsDisabled(true, true);
+  hideClarifyCard(true);
+  try {
+    await api("/api/clarify/respond", {
+      method: "POST",
+      body: JSON.stringify({ session_id: sid, response: value })
+    });
+  } catch(e) { setStatus(t("clarify_responding") + " " + e.message); }
+}
+
+function startClarifyPolling(sid) {
+  stopClarifyPolling();
+  _clarifyMissingEndpointWarned = false;
+  _clarifyPollTimer = setInterval(async () => {
+    if (!S.session || S.session.session_id !== sid) {
+      stopClarifyPolling(); hideClarifyCard(true); return;
+    }
+    try {
+      const data = await api("/api/clarify/pending?session_id=" + encodeURIComponent(sid));
+      if (data.pending) { data.pending._session_id=sid; showClarifyCard(data.pending); }
+      else { hideClarifyCard(); }
+    } catch(e) {
+      const msg = String((e && e.message) || "");
+      if (!_clarifyMissingEndpointWarned && /(^|\b)(404|not found)(\b|$)/i.test(msg)) {
+        _clarifyMissingEndpointWarned = true;
+        setComposerStatus("Clarify unavailable on current server build. Restart server.");
+        if (typeof showToast === "function") {
+          showToast("Clarify endpoint unavailable. Please restart server.", 5000);
+        }
+        stopClarifyPolling();
+      }
+      // Ignore transient poll errors; SSE clarify event still provides a fast path.
+    }
+  }, 1500);
+}
+
+function stopClarifyPolling() {
+  if (_clarifyPollTimer) { clearInterval(_clarifyPollTimer); _clarifyPollTimer = null; }
 }
 
 // ── Notifications and Sound ──────────────────────────────────────────────────

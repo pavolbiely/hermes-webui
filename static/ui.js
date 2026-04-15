@@ -611,11 +611,43 @@ function setComposerStatus(t){
   el.style.display='';
 }
 
+let _composerLockState=null;
+
+function lockComposerForClarify(placeholderText){
+  const input=$('msg');
+  if(!input) return;
+  if(!_composerLockState){
+    _composerLockState={
+      disabled: input.disabled,
+      placeholder: input.placeholder,
+    };
+  }
+  input.disabled=true;
+  if(placeholderText) input.placeholder=placeholderText;
+  updateSendBtn();
+}
+
+function unlockComposerForClarify(){
+  const input=$('msg');
+  if(!input) return;
+  if(_composerLockState){
+    input.disabled=!!_composerLockState.disabled;
+    if(typeof _composerLockState.placeholder==='string'){
+      input.placeholder=_composerLockState.placeholder;
+    }
+    _composerLockState=null;
+  }else{
+    input.disabled=false;
+  }
+  updateSendBtn();
+}
+
 function updateSendBtn(){
   const btn=$('btnSend');
   if(!btn) return;
-  const hasContent=$('msg').value.trim().length>0||S.pendingFiles.length>0;
-  const canSend=hasContent&&!S.busy;
+  const msg=$('msg');
+  const hasContent=msg&&msg.value.trim().length>0||S.pendingFiles.length>0;
+  const canSend=hasContent&&!S.busy&&!(msg&&msg.disabled);
   // Hide while busy (cancel button takes its place); show otherwise
   btn.style.display=S.busy?'none':'';
   btn.disabled=!canSend;
@@ -1830,4 +1862,3 @@ async function uploadPendingFiles(){
   if(failures===total&&total>0)throw new Error(t('all_uploads_failed',total));
   return names;
 }
-

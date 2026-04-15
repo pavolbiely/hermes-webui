@@ -38,6 +38,8 @@ async function newSession(flash){
 
 async function loadSession(sid){
   stopApprovalPolling();hideApprovalCard();
+  if(typeof stopClarifyPolling==='function') stopClarifyPolling();
+  if(typeof hideClarifyCard==='function') hideClarifyCard();
   const data=await api(`/api/session?session_id=${encodeURIComponent(sid)}`);
   S.session=data.session;
   S.lastUsage={...(data.session.last_usage||{})};
@@ -95,6 +97,7 @@ async function loadSession(sid){
     }
     setBusy(true);setComposerStatus('');
     startApprovalPolling(sid);
+    if(typeof startClarifyPolling==='function') startClarifyPolling(sid);
     S.activeStreamId=activeStreamId;
     const _cb=$('btnCancel');if(_cb&&activeStreamId)_cb.style.display='inline-flex';
     if(INFLIGHT[sid].reattach&&activeStreamId&&typeof attachLiveStream==='function'){
@@ -122,6 +125,7 @@ async function loadSession(sid){
       syncTopbar();renderMessages();appendThinking();loadDir('.');
       updateQueueBadge(sid);
       startApprovalPolling(sid);
+      if(typeof startClarifyPolling==='function') startClarifyPolling(sid);
       if(typeof attachLiveStream==='function') attachLiveStream(sid, activeStreamId, data.session.pending_attachments||[], {reconnecting:true});
       else if(typeof watchInflightSession==='function') watchInflightSession(sid, activeStreamId);
     }else{

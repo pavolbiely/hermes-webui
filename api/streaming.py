@@ -88,6 +88,16 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
     if q is None:
         return
 
+    # ── MCP Server Discovery (lazy import, idempotent) ──
+    # discover_mcp_tools() is called here (rather than at server startup) so that
+    # the hermes-agent package is fully initialized before we try to connect.
+    # It is safe to call multiple times — already-connected servers are skipped.
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+        discover_mcp_tools()
+    except Exception:
+        pass  # MCP not available or not configured — non-fatal
+
     # Sprint 10: create a cancel event for this stream
     cancel_event = threading.Event()
     with STREAMS_LOCK:
@@ -161,6 +171,65 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             _approval_registered = True
         except ImportError:
             logger.debug("Approval module not available, falling back to polling")
+
+        _clarify_registered = False
+        _unreg_clarify_notify = None
+        try:
+            from api.clarify import (
+                register_gateway_notify as _reg_clarify_notify,
+                unregister_gateway_notify as _unreg_clarify_notify,
+            )
+
+            def _clarify_notify_cb(clarify_data):
+                put('clarify', clarify_data)
+
+            _reg_clarify_notify(session_id, _clarify_notify_cb)
+            _clarify_registered = True
+        except ImportError:
+            logger.debug("Clarify module not available, falling back to polling")
+
+        def _clarify_callback_impl(question, choices, sid, cancel_evt, put_event):
+            """Bridge Hermes clarify prompts to the WebUI."""
+            timeout = 120
+            choices_list = [str(choice) for choice in (choices or [])]
+            data = {
+                'question': str(question or ''),
+                'choices_offered': choices_list,
+                'session_id': sid,
+                'kind': 'clarify',
+                'requested_at': time.time(),
+            }
+            try:
+                from api.clarify import submit_pending as _submit_clarify_pending, clear_pending as _clear_clarify_pending
+            except ImportError:
+                return (
+                    "The user did not provide a response within the time limit. "
+                    "Use your best judgement to make the choice and proceed."
+                )
+
+            entry = _submit_clarify_pending(sid, data)
+            deadline = time.monotonic() + timeout
+            while True:
+                if cancel_evt.is_set():
+                    _clear_clarify_pending(sid)
+                    return (
+                        "The user did not provide a response within the time limit. "
+                        "Use your best judgement to make the choice and proceed."
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _clear_clarify_pending(sid)
+                    return (
+                        "The user did not provide a response within the time limit. "
+                        "Use your best judgement to make the choice and proceed."
+                    )
+                if entry.event.wait(timeout=min(1.0, remaining)):
+                    response = str(entry.result or "").strip()
+                    return (
+                        response
+                        or "The user did not provide a response within the time limit. "
+                           "Use your best judgement to make the choice and proceed."
+                    )
 
         try:
             _token_sent = False  # tracks whether any streamed tokens were sent
@@ -304,6 +373,11 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 stream_delta_callback=on_token,
                 reasoning_callback=on_reasoning,
                 tool_progress_callback=on_tool,
+                clarify_callback=(
+                    lambda question, choices: _clarify_callback_impl(
+                        question, choices, session_id, cancel_event, put
+                    )
+                ),
             )
 
             # Store agent instance for cancel/interrupt propagation
@@ -565,6 +639,11 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                     _unreg_notify(session_id)
                 except Exception:
                     logger.debug("Failed to unregister approval callback")
+            if _clarify_registered and _unreg_clarify_notify is not None:
+                try:
+                    _unreg_clarify_notify(session_id)
+                except Exception:
+                    logger.debug("Failed to unregister clarify callback")
             with _ENV_LOCK:
                 if old_cwd is None: os.environ.pop('TERMINAL_CWD', None)
                 else: os.environ['TERMINAL_CWD'] = old_cwd
@@ -659,6 +738,15 @@ def cancel_stream(stream_id: str) -> bool:
                 f"Cancel requested for stream {stream_id} before agent ready - "
                 f"cancel_event flag set, will be checked on agent startup"
             )
+
+        # Clear any pending clarify prompt so the blocked tool call can unwind.
+        try:
+            from api.clarify import clear_pending as _clear_clarify_pending
+
+            if agent and getattr(agent, "session_id", None):
+                _clear_clarify_pending(agent.session_id)
+        except Exception:
+            logger.debug("Failed to clear clarify prompt during cancel")
 
         # Put a cancel sentinel into the queue so the SSE handler wakes up
         q = STREAMS.get(stream_id)
