@@ -193,7 +193,7 @@ from api.onboarding import (
 # Approval system (optional -- graceful fallback if agent not available)
 try:
     from tools.approval import (
-        submit_pending,
+        submit_pending as _submit_pending_raw,
         approve_session,
         approve_permanent,
         save_permanent_allowlist,
@@ -204,7 +204,7 @@ try:
         resolve_gateway_approval,
     )
 except ImportError:
-    submit_pending = lambda *a, **k: None
+    _submit_pending_raw = lambda *a, **k: None
     approve_session = lambda *a, **k: None
     approve_permanent = lambda *a, **k: None
     save_permanent_allowlist = lambda *a, **k: None
@@ -213,6 +213,31 @@ except ImportError:
     _pending = {}
     _lock = threading.Lock()
     _permanent_approved = set()
+
+
+def submit_pending(session_key: str, approval: dict) -> None:
+    """Append a pending approval to the per-session queue.
+
+    Wraps the agent's submit_pending to:
+    - Add a stable approval_id (uuid4 hex) so the respond endpoint can target
+      a specific entry even when multiple approvals are queued simultaneously.
+    - Change the storage from a single overwriting dict value to a list, so
+      parallel tool calls each get their own approval slot (fixes #527).
+    """
+    entry = dict(approval)
+    entry.setdefault("approval_id", uuid.uuid4().hex)
+    with _lock:
+        queue = _pending.setdefault(session_key, [])
+        # Replace a legacy non-list value if the agent version uses the old pattern.
+        if not isinstance(queue, list):
+            _pending[session_key] = [queue]
+            queue = _pending[session_key]
+        queue.append(entry)
+    # NOTE: We do NOT call _submit_pending_raw here — that function overwrites
+    # _pending[session_key] with a single dict, which would undo the list we just
+    # built. The gateway blocking path uses _gateway_queues (a separate mechanism
+    # managed by check_all_command_guards / register_gateway_notify), which is
+    # unaffected by _pending. The _pending dict is only used for UI polling.
 
 # Clarify prompts (optional -- graceful fallback if agent not available)
 try:
@@ -1671,10 +1696,20 @@ def _handle_file_read(handler, parsed):
 def _handle_approval_pending(handler, parsed):
     sid = parse_qs(parsed.query).get("session_id", [""])[0]
     with _lock:
-        p = _pending.get(sid)
+        queue = _pending.get(sid)
+        # Support both the new list format and a legacy single-dict value.
+        if isinstance(queue, list):
+            p = queue[0] if queue else None
+            total = len(queue)
+        elif queue:
+            p = queue
+            total = 1
+        else:
+            p = None
+            total = 0
     if p:
-        return j(handler, {"pending": dict(p)})
-    return j(handler, {"pending": None})
+        return j(handler, {"pending": dict(p), "pending_count": total})
+    return j(handler, {"pending": None, "pending_count": 0})
 
 
 def _handle_approval_inject(handler, parsed):
@@ -2354,9 +2389,31 @@ def _handle_approval_respond(handler, body):
     choice = body.get("choice", "deny")
     if choice not in ("once", "session", "always", "deny"):
         return bad(handler, f"Invalid choice: {choice}")
-    # Pop the legacy polling-mode pending entry (no-op when gateway path is active).
+    approval_id = body.get("approval_id", "")
+
+    # Pop the targeted entry from the pending queue by approval_id.
+    # Falls back to popping the first entry for backward-compat with old clients.
+    pending = None
     with _lock:
-        pending = _pending.pop(sid, None)
+        queue = _pending.get(sid)
+        if isinstance(queue, list):
+            if approval_id:
+                # Find and remove the specific entry by approval_id.
+                for i, entry in enumerate(queue):
+                    if entry.get("approval_id") == approval_id:
+                        pending = queue.pop(i)
+                        break
+                else:
+                    # approval_id not found -- fall back to oldest entry.
+                    pending = queue.pop(0) if queue else None
+            else:
+                pending = queue.pop(0) if queue else None
+            if not queue:
+                _pending.pop(sid, None)
+        elif queue:
+            # Legacy single-dict value.
+            pending = _pending.pop(sid, None)
+
     if pending:
         keys = pending.get("pattern_keys") or [pending.get("pattern_key", "")]
         if choice in ("once", "session"):

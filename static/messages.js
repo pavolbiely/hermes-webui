@@ -360,7 +360,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     source.addEventListener('approval',e=>{
       const d=JSON.parse(e.data);
       d._session_id=activeSid;
-      showApprovalCard(d);
+      showApprovalCard(d, 1);
       playNotificationSound();
       sendBrowserNotification('Approval required',d.description||'Tool approval needed');
     });
@@ -595,8 +595,9 @@ function hideApprovalCard(force=false) {
 
 // Track session_id of the active approval so respond goes to the right session
 let _approvalSessionId = null;
+let _approvalCurrentId = null;  // approval_id of the card currently shown
 
-function showApprovalCard(pending) {
+function showApprovalCard(pending, pendingCount) {
   const keys = pending.pattern_keys || (pending.pattern_key ? [pending.pattern_key] : []);
   const desc = (pending.description || "") + (keys.length ? " [" + keys.join(", ") + "]" : "");
   const cmd = pending.command || "";
@@ -606,7 +607,18 @@ function showApprovalCard(pending) {
   $("approvalDesc").textContent = desc;
   $("approvalCmd").textContent = cmd;
   _approvalSessionId = pending._session_id || (S.session && S.session.session_id) || null;
+  _approvalCurrentId = pending.approval_id || null;
   _approvalSignature = sig;
+  // Show "1 of N" counter when multiple approvals are queued
+  const counter = $("approvalCounter");
+  if (counter) {
+    if (pendingCount && pendingCount > 1) {
+      counter.textContent = "1 of " + pendingCount + " pending";
+      counter.style.display = "";
+    } else {
+      counter.style.display = "none";
+    }
+  }
   if (!sameApproval) {
     _approvalVisibleSince = Date.now();
     _clearApprovalHideTimer();
@@ -627,17 +639,19 @@ function showApprovalCard(pending) {
 async function respondApproval(choice) {
   const sid = _approvalSessionId || (S.session && S.session.session_id);
   if (!sid) return;
+  const approvalId = _approvalCurrentId;
   // Disable all buttons immediately to prevent double-submit
   ["approvalBtnOnce","approvalBtnSession","approvalBtnAlways","approvalBtnDeny"].forEach(id => {
     const b = $(id);
     if (b) { b.disabled = true; if (b.id === "approvalBtn" + choice.charAt(0).toUpperCase() + choice.slice(1)) b.classList.add("loading"); }
   });
   _approvalSessionId = null;
+  _approvalCurrentId = null;
   hideApprovalCard(true);
   try {
     await api("/api/approval/respond", {
       method: "POST",
-      body: JSON.stringify({ session_id: sid, choice })
+      body: JSON.stringify({ session_id: sid, choice, approval_id: approvalId })
     });
   } catch(e) { setStatus(t("approval_responding") + " " + e.message); }
 }
@@ -650,7 +664,7 @@ function startApprovalPolling(sid) {
     }
     try {
       const data = await api("/api/approval/pending?session_id=" + encodeURIComponent(sid));
-      if (data.pending) { data.pending._session_id=sid; showApprovalCard(data.pending); }
+      if (data.pending) { data.pending._session_id=sid; showApprovalCard(data.pending, data.pending_count||1); }
       else { hideApprovalCard(); }
     } catch(e) { /* ignore poll errors */ }
   }, 1500);

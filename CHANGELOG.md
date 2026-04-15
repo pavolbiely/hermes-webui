@@ -1,5 +1,10 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.52] — 2026-04-15
+
+### Fixed
+- **Simultaneous approval requests** — parallel tool calls that each require approval no longer overwrite each other. `_pending` is now a list per session; each entry gets a stable `approval_id` (uuid4) so `/api/approval/respond` can target a specific request. The UI shows a "1 of N pending" counter when multiple approvals are queued. Backward-compatible with old agent versions and old frontend clients. Adds 14 regression tests. (Fixes #527)
+
 ## [v0.50.51] — 2026-04-15
 
 ### Fixed
