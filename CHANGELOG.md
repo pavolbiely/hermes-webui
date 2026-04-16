@@ -1,5 +1,10 @@
 # Hermes Web UI -- Changelog
 
+## [v0.50.58] — 2026-04-16
+
+### Fixed
+- **Custom provider name in model dropdown** — when a `custom_providers` entry in `config.yaml` has a `name` field (e.g. `Agent37`), the model picker now shows that name as the group header instead of the generic `Custom` label. Multiple named providers each get their own group. Unnamed entries still fall back to `Custom`. Brings the web UI into parity with the terminal's provider display. (Fixes #557)
+
 ## [v0.50.57] — 2026-04-15
 
 ### Added
