@@ -1123,7 +1123,9 @@ def get_available_models() -> dict:
                 )
             else:
                 # Unknown provider -- use auto-detected models if available,
-                # otherwise fall back to default model placeholder
+                # otherwise skip it for the model dropdown. Do NOT inject the
+                # global default_model here: that would incorrectly imply the
+                # provider can serve the default model (e.g. Alibaba -> gpt-5.4-mini).
                 if auto_detected_models:
                     groups.append(
                         {
@@ -1131,19 +1133,6 @@ def get_available_models() -> dict:
                             "models": auto_detected_models,
                         }
                     )
-                else:
-                    if default_model:
-                        groups.append(
-                            {
-                                "provider": provider_name,
-                                "models": [
-                                    {
-                                        "id": default_model,
-                                        "label": default_model.split("/")[-1],
-                                    }
-                                ],
-                            }
-                        )
     else:
         # No providers detected. Show only the configured default model so the user
         # can at least send messages with their current setting. Avoid showing a
@@ -1186,7 +1175,14 @@ def get_available_models() -> dict:
                     injected = True
                     break
             if not injected and groups:
-                groups[0]["models"].insert(0, {"id": default_model, "label": label})
+                # Keep the default isolated rather than polluting the first
+                # detected provider group.
+                groups.append(
+                    {
+                        "provider": "Default",
+                        "models": [{"id": default_model, "label": label}],
+                    }
+                )
             elif not groups:
                 groups.append(
                     {

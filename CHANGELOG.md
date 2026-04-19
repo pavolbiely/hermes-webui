@@ -13,7 +13,12 @@
 ### Added
 - **Searchable model picker** — the model dropdown now has a live search input at the top. Type any part of a model name or ID to filter the list instantly; provider group headers (Anthropic, OpenAI, OpenRouter, etc.) remain visible in filtered results. Includes a clear button, Escape-to-close support, and a "No models found" empty state. i18n strings added for English, Spanish, and zh-CN. (PR #659 by @mmartial)
 
+## [v0.50.89] — 2026-04-19
 
+### Fixed
+- **System Preferences model dropdown no longer misattributes the default model to unrelated providers** — the `/api/models` builder no longer injects the global `default_model` into unknown provider groups such as `Alibaba` or `Minimax-Cn`. When a provider has no real model catalog of its own, it is now omitted from the dropdown instead of showing a misleading placeholder like `gpt-5.4-mini`. If the active provider still needs a default fallback, it is shown in a separate `Default` group rather than being mixed into another provider's models.
+
+## [v0.50.85] — 2026-04-18
 
 ### Fixed
 - **`_provider_oauth_authenticated()` now respects the `hermes_home` parameter** — the function had a CLI fast path (`hermes_cli.auth.get_auth_status()`) that ignored the caller-supplied `hermes_home` and read from the real system home. On machines where `openai-codex` (or another OAuth provider) was genuinely authenticated, this caused three test assertions to return `True` instead of `False`, regardless of the isolated `tmp_path` the test passed in. Removed the CLI fast path; the function now reads exclusively from `hermes_home/auth.json`, which is both the correct scoped behavior and what the docstring described. No functional change for production (the auth.json path was already the complete fallback). (Fixes pre-existing test_sprint34 failures)
@@ -1641,4 +1646,3 @@ Critical regressions introduced during the server.py split, caught by users and 
 - **Regression test file added** (`tests/test_regressions.py`): 10 tests, one per introduced bug. These form a permanent regression gate so each class of error can never silently return.
 
 ---
-
