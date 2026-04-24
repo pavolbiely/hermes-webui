@@ -5,6 +5,11 @@
 ### Fixed
 - **Reasoning chip now appears after the model chip** in the composer toolbar — model is a more fundamental choice and should be stable in position regardless of whether reasoning is active. Order: Profile → Workspace → Model → Reasoning. (`static/index.html`)
 
+## v0.50.190 — 2026-04-24
+
+### Fixed
+- **`.venv` discovery in `_discover_python()`** — adds `.venv/bin/python` (Linux/macOS) and `.venv/Scripts/python.exe` (Windows) alongside the existing `venv/` paths, fixing issue #938 where setups using a `.venv` directory failed silently to locate the Hermes agent interpreter. (`api/config.py`) By @xingyue52077. Closes #938. [#949]
+
 ## v0.50.189 — 2026-04-24
 
 ### Fixed
