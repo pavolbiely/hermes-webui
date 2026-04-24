@@ -233,6 +233,43 @@ def _is_minimax_route(provider: str = '', model: str = '', base_url: str = '') -
     return 'minimax' in text or 'minimaxi.com' in text
 
 
+def _aux_title_configured() -> bool:
+    """Return True when any auxiliary title_generation config field is meaningfully set."""
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+        tg = _get_auxiliary_task_config('title_generation')
+        provider = tg.get('provider', '') or ''
+        model = tg.get('model', '') or ''
+        base_url = tg.get('base_url', '') or ''
+        return bool(model or base_url or (provider and provider.lower() != 'auto'))
+    except Exception:
+        return False
+
+def _aux_title_timeout(default: float = 15.0) -> float:
+    """Return the configured timeout (seconds) for auxiliary title generation.
+
+    Only accepts positive numeric values.  Falls back to *default* when the
+    value is ``None``, non-numeric, zero, or negative, and emits a debug log
+    so mis-configurations are visible in server output.
+    """
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+        tg = _get_auxiliary_task_config('title_generation')
+        raw = tg.get('timeout')
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (ValueError, TypeError):
+            logger.debug("aux title timeout: non-numeric value %r, falling back to %s", raw, default)
+            return default
+        if value > 0:
+            return value
+        logger.debug("aux title timeout: non-positive value %s, falling back to %s", value, default)
+        return default
+    except Exception:
+        return default
+
 def _title_completion_budget(provider: str = '', model: str = '', base_url: str = '') -> int:
     if _is_minimax_route(provider, model, base_url):
         return 384
@@ -255,6 +292,7 @@ def generate_title_raw_via_aux(
     if _is_minimax_route(provider, model, base_url):
         reasoning_extra["reasoning_split"] = True
     try:
+        _timeout = _aux_title_timeout()
         from agent.auxiliary_client import call_llm
         for idx, prompt in enumerate(prompts):
             messages = [
@@ -270,7 +308,7 @@ def generate_title_raw_via_aux(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=0.2,
-                    timeout=15.0,
+                    timeout=_timeout,
                     extra_body=reasoning_extra,
                 )
                 raw = ''
@@ -388,14 +426,29 @@ def _generate_llm_session_title_for_agent(agent, user_text: str, assistant_text:
     return None, 'llm_invalid', str(raw)[:120]
 
 
-def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, agent=None) -> tuple[Optional[str], str, str]:
-    """Generate a title via dedicated auxiliary LLM route, then sanitize/validate result."""
+def _generate_llm_session_title_via_aux(user_text: str, assistant_text: str, agent=None, *, use_agent_model: bool = False) -> tuple[Optional[str], str, str]:
+    """Generate a title via dedicated auxiliary LLM route, then sanitize/validate result.
+
+    When use_agent_model is False (default), the auxiliary client resolves
+    provider/model/base_url from config.yaml auxiliary.title_generation, which
+    prevents the session's chat model (e.g. a Chinese model) from overriding
+    the dedicated title model.  When True, the agent's attrs are passed through
+    (legacy fallback behaviour).
+    """
+    if use_agent_model and agent:
+        provider = getattr(agent, 'provider', '')
+        model = getattr(agent, 'model', '')
+        base_url = getattr(agent, 'base_url', '')
+    else:
+        provider = ''
+        model = ''
+        base_url = ''
     raw, status = generate_title_raw_via_aux(
         user_text,
         assistant_text,
-        provider=getattr(agent, 'provider', '') if agent else '',
-        model=getattr(agent, 'model', '') if agent else '',
-        base_url=getattr(agent, 'base_url', '') if agent else '',
+        provider=provider,
+        model=model,
+        base_url=base_url,
     )
     if not raw:
         return None, status, ''
@@ -522,14 +575,15 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
         if not still_auto:
             _put_title_status(put_event, session_id, 'skipped', 'manual_title', current)
             return
-        # Prefer the active session model when available so title generation
-        # matches the user's chosen runtime and can use provider-specific fixes.
-        if agent:
+        aux_title_configured = _aux_title_configured()
+        if agent and not aux_title_configured:
             next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
             if not next_title and llm_status in ('llm_error', 'llm_invalid'):
-                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent)
+                next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent, use_agent_model=True)
         else:
-            next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text, agent=agent)
+            next_title, llm_status, raw_preview = _generate_llm_session_title_via_aux(user_text, assistant_text)
+            if not next_title and agent and llm_status in ('llm_error_aux', 'llm_invalid_aux'):
+                next_title, llm_status, raw_preview = _generate_llm_session_title_for_agent(agent, user_text, assistant_text)
         source = llm_status
         if not next_title:
             next_title = _fallback_title_from_exchange(user_text, assistant_text)
@@ -539,14 +593,7 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
         wrote_title = False
         effective_title = current
         if next_title:
-            # Hold _agent_lock only for in-memory mutation + save so title write
-            # is serialized with checkpoint saves, cancel_stream, and other
-            # session-mutating endpoints. The LLM round-trip above ran outside
-            # the lock to avoid blocking other writers.
             with _get_session_agent_lock(session_id):
-                # Stale-object guard: rebind to the canonical cached Session
-                # instance under LOCK before checking whether a user rename
-                # landed while the LLM title request was in-flight.
                 with LOCK:
                     s = SESSIONS.get(session_id, s)
                     effective_title = str(s.title or '').strip()

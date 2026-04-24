@@ -29,6 +29,11 @@
   workspace subtree) and never enumerate blocked system roots. (`api/routes.py`,
   `api/workspace.py`, `static/panels.js`, `static/style.css`) (partial for #616)
 
+## [v0.50.182] — 2026-04-24
+
+### Fixed
+- **Auxiliary title model now respected** — when `auxiliary.title_generation` is explicitly configured in `config.yaml`, the WebUI now routes title generation through that dedicated model instead of silently using the chat session's model. Adds `_aux_title_configured()` to detect meaningful auxiliary config, `_aux_title_timeout()` to respect the configured per-task timeout (was hardcoded to 15.0 s), and adds the missing `llm_invalid_aux` fallback path so invalid auxiliary outputs trigger the agent-model fallback. (`api/streaming.py`, `tests/test_title_aux_routing.py`) Co-authored by @starship-s.
+
 ## [v0.50.181] — 2026-04-24
 
 ### Changed
