@@ -109,7 +109,7 @@ async function loadSession(sid){
   // Guard against network/server failures to prevent a permanently stuck loading state.
   let data;
   try {
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0`);
+    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
   } catch(e) {
     const _msgInner = $('msgInner');
     if (_msgInner) {
@@ -119,6 +119,7 @@ async function loadSession(sid){
     return;
   }
   S.session=data.session;
+  S.session._modelResolutionDeferred=true;
   S.lastUsage={...(data.session.last_usage||{})};
   _setSessionViewedCount(S.session.session_id, Number(data.session.message_count || 0));
   localStorage.setItem('hermes-webui-session',S.session.session_id);
@@ -254,6 +255,23 @@ async function loadSession(sid){
       threshold_tokens:  _pick(u.threshold_tokens,  _s.threshold_tokens),
     });
   }
+  _resolveSessionModelForDisplaySoon(sid);
+}
+
+function _resolveSessionModelForDisplaySoon(sid){
+  if(!sid) return;
+  setTimeout(async()=>{
+    try{
+      const data=await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=1`);
+      const model=data&&data.session&&data.session.model;
+      if(!model||!S.session||S.session.session_id!==sid) return;
+      S.session.model=model;
+      S.session._modelResolutionDeferred=false;
+      syncTopbar();
+    }catch(_){
+      // Keep session switching non-blocking; the next load can try again.
+    }
+  },0);
 }
 
 // Load session messages if not already present.
@@ -266,7 +284,7 @@ async function _ensureMessagesLoaded(sid) {
     return;
   }
   // Fetch full session with messages
-  const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1`);
+  const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0`);
   const msgs = (data.session.messages || []).filter(m => m && m.role);
   // Check for tool-call metadata on messages (for tool-call card rendering)
   const hasMessageToolMetadata = msgs.some(m => {
@@ -282,6 +300,11 @@ async function _ensureMessagesLoaded(sid) {
   }
   clearLiveToolCards();
   S.messages = msgs;
+  if(S.session&&S.session.session_id===sid){
+    S.session.message_count=Number(data.session.message_count || msgs.length);
+    S.lastUsage={...(data.session.last_usage||S.lastUsage||{})};
+    _setSessionViewedCount(sid, Number(S.session.message_count || msgs.length));
+  }
 }
 
 let _allSessions = [];  // cached for search filter
@@ -621,7 +644,7 @@ function filterSessions(){
 }
 
 function _sessionTimestampMs(session) {
-  const raw = Number(session && (session.updated_at || session.created_at || 0));
+  const raw = Number(session && (session.last_message_at || session.updated_at || session.created_at || 0));
   return Number.isFinite(raw) ? raw * 1000 : 0;
 }
 
@@ -803,7 +826,7 @@ function renderSessionListFromCache(){
     hdr.className='session-date-header'+(g.isPinned?' pinned':'');
     const caret=document.createElement('span');
     caret.className='session-date-caret';
-    caret.textContent='\u25B8'; // right-pointing triangle
+    caret.textContent='\u25BE'; // down when expanded; rotated right when collapsed
     const label=document.createElement('span');
     label.textContent=g.label;
     hdr.appendChild(caret);hdr.appendChild(label);
@@ -818,18 +841,25 @@ function renderSessionListFromCache(){
       _saveCollapsed();
     };
     wrapper.appendChild(hdr);
-    for(const s of g.items){ body.appendChild(_renderOneSession(s)); }
+    for(const s of g.items){ body.appendChild(_renderOneSession(s, Boolean(g.isPinned))); }
     wrapper.appendChild(body);
     list.appendChild(wrapper);
   }
   // ── Render session items (extracted for group body use) ──
   // Note: declared after the groups loop but available via function hoisting.
-  function _renderOneSession(s){
+  function _renderOneSession(s, isPinnedGroup=false){
     const el=document.createElement('div');
     const isActive=S.session&&s.session_id===S.session.session_id;
-    const isStreaming=Boolean(s.is_streaming);
+    const isLocalStreaming=Boolean(
+      s.session_id
+      && (
+        (isActive&&S.busy)
+        || (typeof INFLIGHT==='object'&&INFLIGHT&&INFLIGHT[s.session_id])
+      )
+    );
+    const isStreaming=Boolean(s.is_streaming||isLocalStreaming);
     const hasUnread=_hasUnreadForSession(s)&&!isActive;
-    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(isStreaming?' streaming':'');
+    el.className='session-item'+(isActive?' active':'')+(isActive&&S.session&&S.session._flash?' new-flash':'')+(s.archived?' archived':'')+(isStreaming?' streaming':'')+(hasUnread?' unread':'');
     if(isActive&&S.session&&S.session._flash)delete S.session._flash;
     const rawTitle=s.title||'Untitled';
     const tags=(rawTitle.match(/#[\w-]+/g)||[]);
@@ -842,23 +872,21 @@ function renderSessionListFromCache(){
     sessionText.className='session-text';
     const titleRow=document.createElement('div');
     titleRow.className='session-title-row';
-    if(s.pinned){
+    if(s.pinned&&!isPinnedGroup){
       const pinInd=document.createElement('span');
       pinInd.className='session-pin-indicator';
       pinInd.innerHTML=ICONS.pin;
       titleRow.appendChild(pinInd);
     }
-    const state=document.createElement('span');
-    state.className='session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''));
-    titleRow.appendChild(state); // always reserve slot — prevents title shift when indicator appears
     const title=document.createElement('span');
     title.className='session-title';
     title.textContent=cleanTitle||'Untitled';
     title.title='Double-click to rename';
     const tsMs=_sessionTimestampMs(s);
     const ts=document.createElement('span');
-    ts.className='session-time';
-    ts.textContent=_formatRelativeSessionTime(tsMs);
+    const hasAttentionState=isStreaming||hasUnread;
+    ts.className='session-time'+(hasAttentionState?' is-hidden':'');
+    ts.textContent=hasAttentionState?'':_formatRelativeSessionTime(tsMs);
     titleRow.appendChild(title);
     titleRow.appendChild(ts);
     sessionText.appendChild(titleRow);
@@ -942,6 +970,10 @@ function renderSessionListFromCache(){
       }
     }
     el.appendChild(sessionText);
+    const state=document.createElement('span');
+    state.className='session-attention-indicator session-state-indicator'+(isStreaming?' is-streaming':(hasUnread?' is-unread':''));
+    state.setAttribute('aria-hidden','true');
+    el.appendChild(state);
     // Single trigger button that opens a shared dropdown menu
     const actions=document.createElement('div');
     actions.className='session-actions';

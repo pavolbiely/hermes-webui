@@ -25,6 +25,7 @@ from api.config import (
     resolve_model_provider,
 )
 from api.helpers import redact_session_data
+from api.metering import meter
 
 # Global lock for os.environ writes. Per-session locks (_agent_lock) prevent
 # concurrent runs of the SAME session, but two DIFFERENT sessions can still
@@ -292,9 +293,71 @@ def _aux_title_timeout(default: float = 15.0) -> float:
         return default
 
 def _title_completion_budget(provider: str = '', model: str = '', base_url: str = '') -> int:
-    if _is_minimax_route(provider, model, base_url):
-        return 384
-    return 160
+    # Title generation is a small auxiliary task, but reasoning models may
+    # spend a surprising amount of the completion budget before emitting final
+    # content.  Keep the budget high enough for MiniMax/Kimi-style reasoning
+    # responses without making title generation depend on provider-specific
+    # one-off branches.
+    return 512
+
+
+def _title_retry_completion_budget(provider: str = '', model: str = '', base_url: str = '') -> int:
+    return max(1024, _title_completion_budget(provider, model, base_url) * 2)
+
+
+def _title_retry_status(status: str) -> bool:
+    return status in {
+        'llm_length',
+        'llm_length_aux',
+        'llm_empty_reasoning',
+        'llm_empty_reasoning_aux',
+    }
+
+
+def _safe_obj_value(obj, key: str):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    value = getattr(obj, key, None)
+    # Missing MagicMock attrs stringify as mock reprs and look truthy.  Treat
+    # them as absent so tests model real provider objects accurately.
+    if value.__class__.__module__.startswith('unittest.mock'):
+        return None
+    return value
+
+
+def _safe_text_value(value) -> str:
+    if value is None:
+        return ''
+    if value.__class__.__module__.startswith('unittest.mock'):
+        return ''
+    return str(value or '').strip()
+
+
+def _extract_title_response(resp, *, aux: bool = False) -> tuple[str, str]:
+    """Return (content, empty_status) from an OpenAI-compatible response."""
+    suffix = '_aux' if aux else ''
+    try:
+        choices = _safe_obj_value(resp, 'choices') or []
+        choice = choices[0] if choices else None
+        message = _safe_obj_value(choice, 'message')
+        content = _safe_text_value(_safe_obj_value(message, 'content'))
+        if content:
+            return content, ''
+        finish_reason = _safe_text_value(_safe_obj_value(choice, 'finish_reason')).lower()
+        reasoning = (
+            _safe_text_value(_safe_obj_value(message, 'reasoning'))
+            or _safe_text_value(_safe_obj_value(message, 'reasoning_content'))
+            or _safe_text_value(_safe_obj_value(message, 'thinking'))
+        )
+        if finish_reason == 'length':
+            return '', f'llm_length{suffix}'
+        if reasoning:
+            return '', f'llm_empty_reasoning{suffix}'
+        return '', f'llm_empty{suffix}'
+    except Exception:
+        return '', f'llm_empty{suffix}'
 
 
 def generate_title_raw_via_aux(
@@ -308,41 +371,43 @@ def generate_title_raw_via_aux(
     if not user_text or not assistant_text:
         return None, 'missing_exchange'
     qa, prompts = _title_prompts(user_text, assistant_text)
-    max_tokens = _title_completion_budget(provider, model, base_url)
+    base_max_tokens = _title_completion_budget(provider, model, base_url)
     reasoning_extra = {"reasoning": {"enabled": False}}
     if _is_minimax_route(provider, model, base_url):
         reasoning_extra["reasoning_split"] = True
     try:
         _timeout = _aux_title_timeout()
         from agent.auxiliary_client import call_llm
+        last_status = 'llm_error_aux'
         for idx, prompt in enumerate(prompts):
             messages = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": qa},
             ]
+            budgets = [base_max_tokens]
             try:
-                resp = call_llm(
-                    task='title_generation',
-                    provider=provider or None,
-                    model=model or None,
-                    base_url=base_url or None,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=0.2,
-                    timeout=_timeout,
-                    extra_body=reasoning_extra,
-                )
-                raw = ''
-                try:
-                    raw = resp.choices[0].message.content or ''
-                except Exception:
-                    raw = ''
-                raw = str(raw or '').strip()
-                if raw:
-                    return raw, ('llm_aux' if idx == 0 else 'llm_aux_retry')
+                for budget_idx, max_tokens in enumerate(budgets):
+                    resp = call_llm(
+                        task='title_generation',
+                        provider=provider or None,
+                        model=model or None,
+                        base_url=base_url or None,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=0.2,
+                        timeout=_timeout,
+                        extra_body=reasoning_extra,
+                    )
+                    raw, empty_status = _extract_title_response(resp, aux=True)
+                    if raw:
+                        return raw, ('llm_aux' if idx == 0 and budget_idx == 0 else 'llm_aux_retry')
+                    last_status = empty_status or 'llm_empty_aux'
+                    if budget_idx == 0 and _title_retry_status(last_status):
+                        budgets.append(_title_retry_completion_budget(provider, model, base_url))
             except Exception as e:
+                last_status = 'llm_error_aux'
                 logger.debug("Aux title generation attempt %s failed: %s", idx + 1, e)
-        return None, 'llm_error_aux'
+        return None, last_status
     except Exception as e:
         logger.debug("Aux title generation failed: %s", e)
         return None, 'llm_error_aux'
@@ -356,7 +421,7 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
         return None, 'missing_agent'
 
     qa, prompts = _title_prompts(user_text, assistant_text)
-    max_tokens = _title_completion_budget(
+    base_max_tokens = _title_completion_budget(
         getattr(agent, 'provider', ''),
         getattr(agent, 'model', ''),
         getattr(agent, 'base_url', ''),
@@ -370,57 +435,70 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": qa},
             ]
+            budgets = [base_max_tokens]
             try:
-                raw = ""
-                if getattr(agent, 'api_mode', '') == 'codex_responses':
-                    codex_kwargs = agent._build_api_kwargs(api_messages)
-                    codex_kwargs.pop('tools', None)
-                    if 'max_output_tokens' in codex_kwargs:
-                        codex_kwargs['max_output_tokens'] = max_tokens
-                    resp = agent._run_codex_stream(codex_kwargs)
-                    assistant_message, _ = agent._normalize_codex_response(resp)
-                    raw = (assistant_message.content or '') if assistant_message else ''
-                elif getattr(agent, 'api_mode', '') == 'anthropic_messages':
-                    from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
-                    ant_kwargs = build_anthropic_kwargs(
-                        model=agent.model,
-                        messages=api_messages,
-                        tools=None,
-                        max_tokens=max_tokens,
-                        reasoning_config=disabled_reasoning,
-                        is_oauth=getattr(agent, '_is_anthropic_oauth', False),
-                        preserve_dots=agent._anthropic_preserve_dots(),
-                        base_url=getattr(agent, '_anthropic_base_url', None),
-                    )
-                    resp = agent._anthropic_messages_create(ant_kwargs)
-                    assistant_message, _ = normalize_anthropic_response(
-                        resp, strip_tool_prefix=getattr(agent, '_is_anthropic_oauth', False)
-                    )
-                    raw = (assistant_message.content or '') if assistant_message else ''
-                else:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
-                    api_kwargs.pop('tools', None)
-                    api_kwargs['temperature'] = 0.1
-                    api_kwargs['timeout'] = 15.0
-                    if _is_minimax_route(getattr(agent, 'provider', ''), getattr(agent, 'model', ''), getattr(agent, 'base_url', '')):
-                        extra_body = dict(api_kwargs.get('extra_body') or {})
-                        extra_body['reasoning_split'] = True
-                        api_kwargs['extra_body'] = extra_body
-                    if 'max_completion_tokens' in api_kwargs:
-                        api_kwargs['max_completion_tokens'] = max_tokens
+                last_status = 'llm_empty'
+                for budget_idx, max_tokens in enumerate(budgets):
+                    raw = ""
+                    empty_status = ''
+                    if getattr(agent, 'api_mode', '') == 'codex_responses':
+                        codex_kwargs = agent._build_api_kwargs(api_messages)
+                        codex_kwargs.pop('tools', None)
+                        if 'max_output_tokens' in codex_kwargs:
+                            codex_kwargs['max_output_tokens'] = max_tokens
+                        resp = agent._run_codex_stream(codex_kwargs)
+                        assistant_message, _ = agent._normalize_codex_response(resp)
+                        raw = (assistant_message.content or '') if assistant_message else ''
+                        if not raw:
+                            empty_status = 'llm_empty'
+                    elif getattr(agent, 'api_mode', '') == 'anthropic_messages':
+                        from agent.anthropic_adapter import build_anthropic_kwargs, normalize_anthropic_response
+                        ant_kwargs = build_anthropic_kwargs(
+                            model=agent.model,
+                            messages=api_messages,
+                            tools=None,
+                            max_tokens=max_tokens,
+                            reasoning_config=disabled_reasoning,
+                            is_oauth=getattr(agent, '_is_anthropic_oauth', False),
+                            preserve_dots=agent._anthropic_preserve_dots(),
+                            base_url=getattr(agent, '_anthropic_base_url', None),
+                        )
+                        resp = agent._anthropic_messages_create(ant_kwargs)
+                        assistant_message, _ = normalize_anthropic_response(
+                            resp, strip_tool_prefix=getattr(agent, '_is_anthropic_oauth', False)
+                        )
+                        raw = (assistant_message.content or '') if assistant_message else ''
+                        if not raw:
+                            empty_status = 'llm_empty'
                     else:
-                        api_kwargs['max_tokens'] = max_tokens
-                    resp = agent._ensure_primary_openai_client(reason='title_generation').chat.completions.create(
-                        **api_kwargs,
-                    )
-                    try:
-                        raw = resp.choices[0].message.content or ""
-                    except Exception:
-                        raw = ""
-                raw = str(raw or '').strip()
-                if raw:
-                    return raw, ('llm' if idx == 0 else 'llm_retry')
+                        api_kwargs = agent._build_api_kwargs(api_messages)
+                        api_kwargs.pop('tools', None)
+                        api_kwargs['temperature'] = 0.1
+                        api_kwargs['timeout'] = 15.0
+                        if _is_minimax_route(getattr(agent, 'provider', ''), getattr(agent, 'model', ''), getattr(agent, 'base_url', '')):
+                            extra_body = dict(api_kwargs.get('extra_body') or {})
+                            extra_body['reasoning_split'] = True
+                            api_kwargs['extra_body'] = extra_body
+                        if 'max_completion_tokens' in api_kwargs:
+                            api_kwargs['max_completion_tokens'] = max_tokens
+                        else:
+                            api_kwargs['max_tokens'] = max_tokens
+                        resp = agent._ensure_primary_openai_client(reason='title_generation').chat.completions.create(
+                            **api_kwargs,
+                        )
+                        raw, empty_status = _extract_title_response(resp)
+                    raw = str(raw or '').strip()
+                    if raw:
+                        return raw, ('llm' if idx == 0 and budget_idx == 0 else 'llm_retry')
+                    last_status = empty_status or 'llm_empty'
+                    if budget_idx == 0 and _title_retry_status(last_status):
+                        budgets.append(_title_retry_completion_budget(
+                            getattr(agent, 'provider', ''),
+                            getattr(agent, 'model', ''),
+                            getattr(agent, 'base_url', ''),
+                        ))
             except Exception as e:
+                last_status = 'llm_error'
                 logger.debug(
                     "Agent title generation attempt %s failed: provider=%s model=%s error=%s",
                     idx + 1,
@@ -428,7 +506,7 @@ def generate_title_raw_via_agent(agent, user_text: str, assistant_text: str) -> 
                     getattr(agent, 'model', None),
                     e,
                 )
-        return None, 'llm_error'
+        return None, last_status
     except Exception as e:
         logger.debug("Agent title generation failed: %s", e)
         return None, 'llm_error'
@@ -611,6 +689,11 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
             if next_title:
                 logger.debug("Using local fallback for session title generation")
                 source = 'fallback'
+        fallback_reason = (
+            f'local_summary:{llm_status}'
+            if source == 'fallback' and llm_status
+            else 'local_summary'
+        )
         wrote_title = False
         effective_title = current
         if next_title:
@@ -638,7 +721,7 @@ def _run_background_title_update(session_id: str, user_text: str, assistant_text
 
         if wrote_title:
             if source == 'fallback':
-                _put_title_status(put_event, session_id, source, 'local_summary', effective_title, raw_preview)
+                _put_title_status(put_event, session_id, source, fallback_reason, effective_title, raw_preview)
             else:
                 _put_title_status(put_event, session_id, source, llm_status, effective_title, raw_preview)
             put_event('title', {'session_id': session_id, 'title': effective_title})
@@ -919,6 +1002,28 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
         CANCEL_FLAGS[stream_id] = cancel_event
         STREAM_PARTIAL_TEXT[stream_id] = ''  # start accumulating partial text (#893)
 
+    # Register this stream with the global streaming meter
+    meter().begin_session(stream_id)
+
+    # Metering ticker — emits a metering event at 1 Hz while sessions are active.
+    # When get_interval() returns >= 10.0 (no active sessions), the ticker exits
+    # so no idle readings are emitted and the SSE consumer sees nothing.
+    _metering_stop = threading.Event()
+
+    def _metering_ticker():
+        while True:
+            interval = meter().get_interval()
+            if interval >= 10.0:
+                break  # nothing active — stop the ticker
+            if _metering_stop.wait(interval):
+                break  # stream was cancelled or ended — exit
+            stats = meter().get_stats()
+            stats['session_id'] = stream_id
+            put('metering', stats)
+
+    _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
+    _metering_thread.start()
+
     def put(event, data):
         # If cancelled, drop all further events except the cancel event itself
         if cancel_event.is_set() and event not in ('cancel', 'error'):
@@ -1061,6 +1166,19 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             _reasoning_text = ''  # accumulates reasoning/thinking trace for persistence
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
 
+            # Throttle: emit metering events at most every 100 ms so the TPS label
+            # feels live during fast token streams without flooding the SSE channel.
+            _metering_last_emit = [time.monotonic() - 1]  # fire immediately on first token
+
+            def _emit_metering():
+                now = time.monotonic()
+                if now - _metering_last_emit[0] < 0.1:
+                    return
+                _metering_last_emit[0] = now
+                stats = meter().get_stats()
+                stats['session_id'] = stream_id
+                put('metering', stats)
+
             def on_token(text):
                 nonlocal _token_sent
                 if text is None:
@@ -1070,6 +1188,9 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 if stream_id in STREAM_PARTIAL_TEXT:
                     STREAM_PARTIAL_TEXT[stream_id] += str(text)
                 put('token', {'text': text})
+                # Update global throughput meter
+                meter().record_token(stream_id, len(STREAM_PARTIAL_TEXT[stream_id]))
+                _emit_metering()
 
             def on_reasoning(text):
                 nonlocal _reasoning_text
@@ -1077,6 +1198,9 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                     return
                 _reasoning_text += str(text)
                 put('reasoning', {'text': str(text)})
+                # Track reasoning tokens in the meter so TPS reflects all AI output
+                meter().record_reasoning(stream_id, len(_reasoning_text))
+                _emit_metering()
 
             # Pre-initialise the activity counter here so on_tool (which
             # closes over it) never captures an unbound name even if this
@@ -1084,6 +1208,7 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             _checkpoint_activity = [0]
 
             def on_tool(*cb_args, **cb_kwargs):
+                nonlocal _reasoning_text
                 event_type = None
                 name = None
                 preview = None
@@ -1103,7 +1228,10 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 if event_type in ('reasoning.available', '_thinking'):
                     reason_text = preview if event_type == 'reasoning.available' else name
                     if reason_text:
+                        _reasoning_text += str(reason_text)
                         put('reasoning', {'text': str(reason_text)})
+                        meter().record_reasoning(stream_id, len(_reasoning_text))
+                        _emit_metering()
                     return
 
                 args_snap = {}
@@ -1623,6 +1751,10 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             # (reasoning trace already attached + saved above, before s.save())
             raw_session = s.compact() | {'messages': s.messages, 'tool_calls': tool_calls}
             put('done', {'session': redact_session_data(raw_session), 'usage': usage})
+            # Emit metering stats for the header TPS label
+            meter_stats = meter().get_stats()
+            meter_stats['session_id'] = session_id
+            put('metering', meter_stats)
             if _should_bg_title and _u0 and _a0:
                 threading.Thread(
                     target=_run_background_title_update,
@@ -1635,6 +1767,8 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 # activeSid = original session_id so they must match for stream_end to close.
                 put('stream_end', {'session_id': session_id})
         finally:
+            # Stop the live metering ticker
+            _metering_stop.set()
             # Unregister the gateway approval callback and unblock any threads
             # still waiting on approval (e.g. stream cancelled mid-approval).
             if _approval_registered and _unreg_notify is not None:
@@ -1660,6 +1794,13 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
     except Exception as e:
         print('[webui] stream error:\n' + traceback.format_exc(), flush=True)
         err_str = str(e)
+        # Sanitize HTML from provider error responses — some providers return
+        # full HTML pages (e.g. nginx "404 page not found") instead of JSON errors.
+        # Strip HTML tags to avoid rendering raw markup in the chat message.
+        _stripped = re.sub(r'<[^>]+>', ' ', err_str)
+        _stripped = re.sub(r'\s+', ' ', _stripped).strip()
+        if _stripped != err_str:
+            err_str = _stripped
         _exc_lower = err_str.lower()
         # Classify before saving so the error message can be persisted to the session.
         # Check quota exhaustion first — OpenAI billing 429s use insufficient_quota which
@@ -1683,6 +1824,16 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
             or 'invalid api key' in _exc_lower
             or 'no cookie auth credentials' in _exc_lower
         )
+        _exc_is_not_found = (
+            '404' in err_str
+            or 'not found' in _exc_lower
+            or 'does not exist' in _exc_lower
+            or 'model not found' in _exc_lower
+            or 'model_not_found' in _exc_lower
+            or 'invalid model' in _exc_lower
+            or 'does not match any known model' in _exc_lower
+            or 'unknown model' in _exc_lower
+        )
         if _exc_is_quota:
             _exc_label, _exc_type, _exc_hint = (
                 'Out of credits', 'quota_exhausted',
@@ -1698,6 +1849,12 @@ def _run_agent_streaming(session_id, msg_text, model, workspace, stream_id, atta
                 'Authentication error', 'auth_mismatch',
                 'The selected model may not be supported by your configured provider. '
                 'Run `hermes model` in your terminal to switch providers, then restart the WebUI.',
+            )
+        elif _exc_is_not_found:
+            _exc_label, _exc_type, _exc_hint = (
+                'Model not found', 'model_not_found',
+                'The selected model was not found by the provider. '
+                'Check the model ID in Settings or run `hermes model` to verify it exists for your provider.',
             )
         else:
             _exc_label, _exc_type, _exc_hint = 'Error', 'error', ''

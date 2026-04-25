@@ -77,6 +77,7 @@ async function send(){
   if(typeof saveInflightState==='function'){
     saveInflightState(activeSid,{streamId:null,messages:INFLIGHT[activeSid].messages,uploaded:uploadedNames,toolCalls:[]});
   }
+  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
   startApprovalPolling(activeSid);
   startClarifyPolling(activeSid);
   S.activeStreamId = null;  // will be set after stream starts
@@ -754,6 +755,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(err){}
     });
 
+    source.addEventListener('metering',e=>{
+      // TPS + HIGH/LOW stats for the header chip — emitted at 1 Hz during a stream,
+      // silenced entirely when no sessions are active (ticker exits when idle).
+      try{
+        const d=JSON.parse(e.data||'{}');
+        const el=$('tpsStat');
+        if(!el) return;
+        const tps=typeof d.tps==='number'?d.tps.toFixed(1):'0.0';
+        const high=typeof d.high==='number' && d.high>=0?d.high.toFixed(1)+' high':'—';
+        const low=typeof d.low==='number' && d.low>=0?d.low.toFixed(1)+' low':'';
+        el.textContent=`${tps} t/s · ${high}${low?' · '+low:''}`;
+      }catch(_){}
+    });
+
     source.addEventListener('apperror',e=>{
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -775,8 +790,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const isRateLimit=d.type==='rate_limit';
           const isQuotaExhausted=d.type==='quota_exhausted';
           const isAuthMismatch=d.type==='auth_mismatch';
+          const isModelNotFound=d.type==='model_not_found';
           const isNoResponse=d.type==='no_response';
-          const label=isQuotaExhausted?'Out of credits':isRateLimit?'Rate limit reached':isAuthMismatch?(typeof t==='function'?t('provider_mismatch_label'):'Provider mismatch'):isNoResponse?'No response received':'Error';
+          const label=isQuotaExhausted?'Out of credits':isRateLimit?'Rate limit reached':isAuthMismatch?(typeof t==='function'?t('provider_mismatch_label'):'Provider mismatch'):isModelNotFound?(typeof t==='function'?t('model_not_found_label'):'Model not found'):isNoResponse?'No response received':'Error';
           const hint=d.hint?`\n\n*${d.hint}*`:'';
           S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`});
         }catch(_){

@@ -1428,6 +1428,7 @@ function syncTopbar(){
     // If the model isn't in the current provider list, silently reset to the
     // first available model so stale values don't pollute the picker (#829).
     if(!applied && currentModel){
+      const deferModelCorrection=Boolean(S.session._modelResolutionDeferred);
       // Stale session model not in the current provider catalog — reset to the
       // first available model rather than injecting an "(unavailable)" option
       // that visually appears under the wrong provider group (#829).
@@ -1435,13 +1436,15 @@ function syncTopbar(){
       const first=modelSel&&modelSel.querySelector('optgroup > option, option');
       if(first){
         modelSel.value=first.value;
-        S.session.model=first.value;
-        // Persist the correction so the session doesn't re-inject on next load.
-        fetch(new URL('api/session/update',location.href).href,{
-          method:'POST',credentials:'include',
-          headers:{'Content-Type':'application/json'},
-          body:JSON.stringify({session_id:S.session.id||S.session.session_id,model:first.value})
-        }).catch(()=>{});
+        if(!deferModelCorrection){
+          S.session.model=first.value;
+          // Persist the correction so the session doesn't re-inject on next load.
+          fetch(new URL('api/session/update',location.href).href,{
+            method:'POST',credentials:'include',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({session_id:S.session.id||S.session.session_id,model:first.value})
+          }).catch(()=>{});
+        }
       }
     }
   }
@@ -2176,6 +2179,9 @@ function buildToolCard(tc){
 // message column eliminates the visible "jump" users saw when renderMessages
 // fired on the done event.
 function appendLiveToolCard(tc){
+  // Guard: ignore if session was switched. Prevents stale tool events from
+  // a previous session's SSE stream from manipulating the new session's DOM.
+  if(!S.session||!S.activeStreamId) return;
   let turn=$('liveAssistantTurn');
   if(!turn){
     appendThinking();
@@ -2463,10 +2469,22 @@ function finalizeThinkingCard(){
     row.remove();
     return;
   }
+  // If the user was watching (scroll pinned = at bottom), scroll the thinking
+  // card back to the top so the completed response is visible underneath without
+  // the thinking content blocking it. If they scrolled up to read history,
+  // leave their scroll position intact.
+  if(_scrollPinned){
+    const body=row&&row.querySelector('.thinking-card-body');
+    if(body) body.scrollTop=0;
+  }
   row.removeAttribute('id');
   row.removeAttribute('data-thinking-active');
 }
 function appendThinking(text=''){
+  // Guard: ignore if session was switched during an async SSE stream.
+  // The old stream's reasoning events can still fire after switch;
+  // without this check they would pollute the new session's DOM.
+  if(!S.session||!S.activeStreamId) return;
   $('emptyState').style.display='none';
   let turn=$('liveAssistantTurn');
   if(!turn){
@@ -2496,6 +2514,12 @@ function appendThinking(text=''){
   row.className=(text&&String(text).trim())?'assistant-segment thinking-card-row':'assistant-segment';
   row.innerHTML=_thinkingMarkup(text);
   scrollIfPinned();
+  // Auto-scroll the thinking card body to bottom if the user is watching
+  // (scroll pinned). If the user scrolled up to read history, leave it alone.
+  if(_scrollPinned){
+    const body=row&&row.querySelector('.thinking-card-body');
+    if(body) body.scrollTop=body.scrollHeight;
+  }
 }
 function updateThinking(text=''){appendThinking(text);}
 function removeThinking(){
@@ -2759,6 +2783,24 @@ async function promptNewFolder(){
     await api('/api/file/create-dir',{method:'POST',body:JSON.stringify({session_id:S.session.session_id,path:relPath})});
     showToast(t('folder_created')+name.trim());
     await loadDir(S.currentDir);
+    // Offer to add the new folder as a space (#782)
+    const absPath=S.session.workspace?((S.currentDir==='.'?S.session.workspace:S.session.workspace+'/'+S.currentDir)+'/'+name.trim()):null;
+    if(absPath){
+      const addAsSpace=await showConfirmDialog({
+        title:t('folder_add_as_space_title'),
+        message:t('folder_add_as_space_msg'),
+        confirmLabel:t('folder_add_as_space_btn'),
+        focusCancel:true
+      });
+      if(addAsSpace){
+        try{
+          const data=await api('/api/workspaces/add',{method:'POST',body:JSON.stringify({path:absPath})});
+          if(typeof _workspaceList!=='undefined')_workspaceList=data.workspaces||_workspaceList||[];
+          if(typeof renderWorkspacesPanel==='function')renderWorkspacesPanel(_workspaceList);
+          showToast(t('workspace_added'));
+        }catch(e2){setStatus((t('error_prefix')||'Error: ')+e2.message);}
+      }
+    }
   }catch(e){setStatus(t('folder_create_failed')+e.message);}
 }
 

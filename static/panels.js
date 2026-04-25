@@ -257,6 +257,7 @@ function openCronDetail(id, el){
 }
 
 function _clearCronDetail(){
+  if (_cronRunningPoll) { clearInterval(_cronRunningPoll); _cronRunningPoll = null; }
   _currentCronDetail = null;
   _cronMode = 'empty';
   const title = $('taskDetailTitle');
@@ -487,12 +488,53 @@ function _cronOutputSnippet(content) {
   return body.slice(0, 600) || '(empty)';
 }
 
+let _cronRunningPoll = null; // timer for polling job status after trigger
+
 async function cronRun(id) {
   try {
     await api('/api/crons/run', {method:'POST', body: JSON.stringify({job_id: id})});
     showToast(t('cron_job_triggered'));
-    setTimeout(() => { if (_currentCronDetail && _currentCronDetail.id === id) _loadCronDetailRuns(id); }, 5000);
+    // Immediately show "running" state in detail if this job is selected
+    if (_currentCronDetail && _currentCronDetail.id === id) {
+      _setCronDetailStatus('running');
+      _startCronRunningPoll(id);
+    }
   } catch(e) { showToast(t('failed_colon') + e.message, 4000); }
+}
+
+function _setCronDetailStatus(status) {
+  const badge = document.querySelector('#taskDetailBody .detail-badge');
+  if (!badge) return;
+  if (status === 'running') {
+    badge.className = 'detail-badge running';
+    badge.textContent = t('cron_status_running');
+  }
+}
+
+function _startCronRunningPoll(jobId) {
+  // Clear any existing poll
+  if (_cronRunningPoll) { clearInterval(_cronRunningPoll); _cronRunningPoll = null; }
+  let attempts = 0;
+  const maxAttempts = 10; // 10 * 3s = 30s max
+  _cronRunningPoll = setInterval(async () => {
+    attempts++;
+    if (!_currentCronDetail || _currentCronDetail.id !== jobId || attempts > maxAttempts) {
+      clearInterval(_cronRunningPoll);
+      _cronRunningPoll = null;
+      // Re-render detail with real status when poll ends (fallback from "running" indicator)
+      if (_currentCronDetail && _currentCronDetail.id === jobId) {
+        const refreshed = _cronList ? _cronList.find(j => j.id === jobId) : null;
+        if (refreshed) _renderCronDetail(refreshed);
+      }
+      return;
+    }
+    try {
+      await loadCrons();
+      // loadCrons() re-renders the detail which overwrites our "running" badge.
+      // Re-apply the running indicator if poll is still active.
+      if (_cronRunningPoll) _setCronDetailStatus('running');
+    } catch(e) { /* ignore */ }
+  }, 3000);
 }
 
 async function cronPause(id) {
@@ -1406,6 +1448,12 @@ function _renderWorkspaceForm({ name, path, isEdit }){
           </div>
           ${pathHint}
         </div>
+        ${!isEdit?`<div class="detail-form-row">
+          <label class="detail-form-check">
+            <input type="checkbox" id="workspaceFormAutoCreate">
+            ${esc(t('workspace_auto_create_folder')||'Create folder if it doesn\'t exist')}
+          </label>
+        </div>`:''}
         <div id="workspaceFormError" class="detail-form-error" style="display:none"></div>
       </form>
     </div>`;
@@ -1451,7 +1499,7 @@ async function saveWorkspaceForm(){
       openWorkspaceDetail(targetPath);
       return;
     }
-    const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify({ path }) });
+    const data = await api('/api/workspaces/add', { method:'POST', body: JSON.stringify({ path, name, create: ($('workspaceFormAutoCreate')&&$('workspaceFormAutoCreate').checked)||false }) });
     _workspaceList = data.workspaces || [];
     _workspacePreFormDetail = null;
     // Apply rename if a friendly name was supplied

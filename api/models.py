@@ -15,6 +15,7 @@ from api.config import (
     get_effective_default_model,
 )
 from api.workspace import get_last_workspace
+from api.agent_sessions import read_importable_agent_session_rows
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,114 @@ def _active_stream_ids():
 def _is_streaming_session(active_stream_id, active_stream_ids):
     return bool(active_stream_id and active_stream_id in active_stream_ids)
 
+def _session_sort_timestamp(session):
+    if isinstance(session, dict):
+        return session.get('last_message_at') or session.get('updated_at') or 0
+    return _last_message_timestamp(getattr(session, 'messages', None)) or getattr(session, 'updated_at', 0) or 0
+
+
+def _message_timestamp(message):
+    if not isinstance(message, dict):
+        return None
+    raw = message.get('_ts') or message.get('timestamp')
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_message_timestamp(messages):
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get('role') == 'tool':
+            continue
+        ts = _message_timestamp(message)
+        if ts:
+            return ts
+    return None
+
+
+def _find_top_level_json_key(text, key):
+    """Return the byte offset of a top-level JSON object key, if present."""
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            start = i
+            i += 1
+            escaped = False
+            chars = []
+            while i < n:
+                c = text[i]
+                if escaped:
+                    chars.append(c)
+                    escaped = False
+                elif c == '\\':
+                    escaped = True
+                elif c == '"':
+                    break
+                else:
+                    chars.append(c)
+                i += 1
+            if i >= n:
+                return None
+            if depth == 1 and ''.join(chars) == key:
+                j = i + 1
+                while j < n and text[j] in ' \t\r\n':
+                    j += 1
+                if j < n and text[j] == ':':
+                    return start
+        elif ch in '{[':
+            depth += 1
+        elif ch in '}]':
+            depth -= 1
+        i += 1
+    return None
+
+
+def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
+    """Read only the metadata portion before the top-level messages array."""
+    buf = ''
+    with open(path, 'r', encoding='utf-8') as f:
+        while len(buf.encode('utf-8')) < max_prefix_bytes:
+            chunk = f.read(4096)
+            if not chunk:
+                return None
+            buf += chunk
+            messages_pos = _find_top_level_json_key(buf, 'messages')
+            if messages_pos is None:
+                continue
+            prefix = buf[:messages_pos].rstrip()
+            if prefix.endswith(','):
+                prefix = prefix[:-1].rstrip()
+            return f'{prefix}\n}}'
+    return None
+
+
+def _lookup_index_message_count(session_id):
+    """Return the indexed message count without loading the full session file."""
+    try:
+        entries = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if entry.get('session_id') != session_id:
+            continue
+        count = entry.get('message_count')
+        if isinstance(count, int) and count >= 0:
+            return count
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return None
+        return count if count >= 0 else None
+    return None
+
 
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
@@ -231,6 +340,7 @@ class Session:
         self.pending_started_at = pending_started_at
         self.compression_anchor_visible_idx = compression_anchor_visible_idx
         self.compression_anchor_message_key = compression_anchor_message_key
+        self._metadata_message_count = None
 
     @property
     def path(self):
@@ -255,7 +365,8 @@ class Session:
         meta['tool_calls'] = self.tool_calls
         # Fields not in METADATA_FIELDS (e.g. last_usage, message_count) go at the end
         extra = {k: v for k, v in self.__dict__.items()
-                 if k not in METADATA_FIELDS and k not in ('messages', 'tool_calls')}
+                 if k not in METADATA_FIELDS and k not in ('messages', 'tool_calls')
+                 and not k.startswith('_')}
         payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
         tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
         try:
@@ -288,10 +399,9 @@ class Session:
         """Load only the compact metadata fields, skipping the messages array.
 
         Session JSON files have metadata fields (session_id, title, model, etc.)
-        at the top level, before the large messages array. We read only the
-        first ~1KB — enough to capture all compact() fields — then parse just
-        that prefix. Falls back to load() if the prefix doesn't contain enough
-        fields or if the file is unexpectedly small.
+        at the top level, before the large messages array. Read only up to the
+        top-level "messages" field and synthesize a small metadata-only object.
+        Falls back to load() for legacy or unexpected file layouts.
         """
         if not sid or not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
             return None
@@ -299,26 +409,18 @@ class Session:
         if not p.exists():
             return None
         try:
-            # Read just the first 1 KB — metadata comes before messages array
-            with open(p, 'r', encoding='utf-8') as f:
-                prefix = f.read(1024)
+            prefix = _read_metadata_json_prefix(p)
             if not prefix:
                 return cls.load(sid)
             parsed = json.loads(prefix)
-            # Verify we got the essential fields.
-            # With metadata-first save() ordering, messages appears at byte ~567.
-            # For sessions <= ~512 bytes total the entire messages array fits in the
-            # first 1 KB and we get a valid list. For larger sessions json.loads
-            # fails on the truncated buffer (unterminated string), so we fall back
-            # to full load. The one exception is a truncation inside a string value
-            # that happens to produce valid JSON with a truncated string — guard
-            # against that by requiring messages to be a list.
             needed = {'session_id', 'title', 'created_at', 'updated_at'}
             if not needed.issubset(parsed.keys()):
                 return cls.load(sid)
-            if not isinstance(parsed.get('messages'), list):
-                return cls.load(sid)
-            return cls(**parsed)
+            parsed['messages'] = []
+            parsed['tool_calls'] = []
+            session = cls(**parsed)
+            session._metadata_message_count = _lookup_index_message_count(sid)
+            return session
         except Exception:
             # Corrupt prefix or decode error — fall back to full load
             return cls.load(sid)
@@ -330,9 +432,14 @@ class Session:
             'title': self.title,
             'workspace': self.workspace,
             'model': self.model,
-            'message_count': len(self.messages),
+            'message_count': (
+                self._metadata_message_count
+                if self._metadata_message_count is not None
+                else len(self.messages)
+            ),
             'created_at': self.created_at,
             'updated_at': self.updated_at,
+            'last_message_at': _last_message_timestamp(self.messages) or self.updated_at,
             'pinned': self.pinned,
             'archived': self.archived,
             'project_id': self.project_id,
@@ -352,9 +459,10 @@ class Session:
 def get_session(sid, metadata_only=False):
     """Load a session, optionally with metadata only (skipping the messages array).
 
-    When metadata_only=True the session is still cached so the full load on the
-    next access is fast. Use this when you only need compact() metadata and not
-    the actual message history (e.g., for fast sidebar switching).
+    Metadata-only loads intentionally do not populate the full-session cache.
+    Otherwise a later full load could return a compact object with an empty
+    messages list. Use this when you only need compact() metadata and not the
+    actual message history (e.g., for fast sidebar switching).
     """
     with LOCK:
         if sid in SESSIONS:
@@ -362,6 +470,8 @@ def get_session(sid, metadata_only=False):
             return SESSIONS[sid]
     if metadata_only:
         s = Session.load_metadata_only(sid)
+        if s:
+            return s
     else:
         s = Session.load(sid)
     if s:
@@ -413,6 +523,18 @@ def all_sessions():
                 s for s in index
                 if _index_entry_exists(s.get('session_id'))
             ]
+            backfilled = []
+            for i, s in enumerate(index):
+                if 'last_message_at' not in s:
+                    full = Session.load(s.get('session_id'))
+                    if full:
+                        index[i] = full.compact()
+                        backfilled.append(full)
+            if backfilled:
+                try:
+                    _write_session_index(updates=backfilled)
+                except Exception:
+                    logger.debug("Failed to persist last_message_at backfill")
             for s in index:
                 s['is_streaming'] = _is_streaming_session(
                     s.get('active_stream_id'),
@@ -426,7 +548,7 @@ def all_sessions():
                         include_runtime=True,
                         active_stream_ids=active_stream_ids,
                     )
-            result = sorted(index_map.values(), key=lambda s: (s.get('pinned', False), s['updated_at']), reverse=True)
+            result = sorted(index_map.values(), key=lambda s: (s.get('pinned', False), _session_sort_timestamp(s)), reverse=True)
             # Hide empty Untitled sessions from the UI (created by tests, page refreshes, etc.)
             # Exempt sessions younger than 60 s so a brand-new session stays visible (#789)
             _now = time.time()
@@ -454,7 +576,7 @@ def all_sessions():
             logger.debug("Failed to load session from %s", p)
     for s in SESSIONS.values():
         if all(s.session_id != x.session_id for x in out): out.append(s)
-    out.sort(key=lambda s: (getattr(s, 'pinned', False), s.updated_at), reverse=True)
+    out.sort(key=lambda s: (getattr(s, 'pinned', False), _session_sort_timestamp(s)), reverse=True)
     _now = time.time()
     result = [s.compact(include_runtime=True, active_stream_ids=active_stream_ids) for s in out if not (
         s.title == 'Untitled'
@@ -528,16 +650,11 @@ def get_cli_sessions() -> list:
     """Read CLI sessions from the agent's SQLite store and return them as
     dicts in a format the WebUI sidebar can render alongside local sessions.
 
-    Returns empty list if the SQLite DB is missing, the sqlite3 module is
-    unavailable, or any error occurs -- the bridge is purely additive and never
-    crashes the WebUI.
+    Returns empty list if the SQLite DB is missing or any error occurs -- the
+    bridge is purely additive and never crashes the WebUI.
     """
     import os
     cli_sessions = []
-    try:
-        import sqlite3
-    except ImportError:
-        return cli_sessions
 
     # Use the active WebUI profile's HERMES_HOME to find state.db.
     # The active profile is determined by what the user has selected in the UI
@@ -566,59 +683,30 @@ def get_cli_sessions() -> list:
         _cli_profile = None  # older agent -- fall back to no profile
 
     try:
-        with sqlite3.connect(str(db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            # Introspect schema to handle older hermes-agent versions that
-            # may not have a 'source' column. Without this check the query raises
-            # OperationalError which is silently swallowed, causing the empty-list bug.
-            cur.execute("PRAGMA table_info(sessions)")
-            _session_cols = {row[1] for row in cur.fetchall()}
-            if 'source' not in _session_cols:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
-                    "get_cli_sessions(): state.db at %s has no 'source' column "
-                    "(older hermes-agent?). CLI sessions unavailable. "
-                    "Upgrade hermes-agent to fix this.",
-                    db_path,
-                )
-                return cli_sessions
+        for row in read_importable_agent_session_rows(db_path, limit=200, log=logger):
+            sid = row['id']
+            raw_ts = row['last_activity'] or row['started_at']
+            # Prefer the CLI session's own profile from the DB; fall back to
+            # the active CLI profile so sidebar filtering works either way.
+            profile = _cli_profile  # CLI DB has no profile column; use active profile
 
-            cur.execute("""
-                SELECT s.id, s.title, s.model, s.message_count,
-                       s.started_at, s.source,
-                       MAX(m.timestamp) AS last_activity
-                FROM sessions s
-                LEFT JOIN messages m ON m.session_id = s.id
-                WHERE s.source IS NOT NULL AND s.source != 'webui'
-                GROUP BY s.id
-                ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC
-                LIMIT 200
-            """)
-            for row in cur.fetchall():
-                sid = row['id']
-                raw_ts = row['last_activity'] or row['started_at']
-                # Prefer the CLI session's own profile from the DB; fall back to
-                # the active CLI profile so sidebar filtering works either way.
-                profile = _cli_profile  # CLI DB has no profile column; use active profile
-
-                _source = row['source'] or 'cli'
-                _display_title = row['title'] or f'{_source.title()} Session'
-                cli_sessions.append({
-                    'session_id': sid,
-                    'title': _display_title,
-                    'workspace': str(get_last_workspace()),
-                    'model': row['model'] or None,
-                    'message_count': row['message_count'] or 0,
-                    'created_at': row['started_at'],
-                    'updated_at': raw_ts,
-                    'pinned': False,
-                    'archived': False,
-                    'project_id': None,
-                    'profile': profile,
-                    'source_tag': _source,
-                    'is_cli_session': True,
-                })
+            _source = row['source'] or 'cli'
+            _display_title = row['title'] or f'{_source.title()} Session'
+            cli_sessions.append({
+                'session_id': sid,
+                'title': _display_title,
+                'workspace': str(get_last_workspace()),
+                'model': row['model'] or None,
+                'message_count': row['message_count'] or row['actual_message_count'] or 0,
+                'created_at': row['started_at'],
+                'updated_at': raw_ts,
+                'pinned': False,
+                'archived': False,
+                'project_id': None,
+                'profile': profile,
+                'source_tag': _source,
+                'is_cli_session': True,
+            })
     except Exception as _cli_err:
         # DB schema changed, locked, or corrupted -- log warning so admins can diagnose.
         # Still degrade gracefully (don't crash the WebUI).

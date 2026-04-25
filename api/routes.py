@@ -329,6 +329,7 @@ from api.workspace import (
     safe_resolve_ws,
     resolve_trusted_workspace,
     validate_workspace_to_add,
+    _workspace_blocked_roots,
 )
 from api.upload import handle_upload, handle_transcribe
 from api.streaming import _sse, _run_agent_streaming, cancel_stream
@@ -680,19 +681,26 @@ def handle_get(handler, parsed) -> bool:
         import time as _time
         _t0 = _time.monotonic()
         _debug_slow = os.environ.get("HERMES_DEBUG_SLOW", "")
-        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        query = parse_qs(parsed.query)
+        sid = query.get("session_id", [""])[0]
         if not sid:
             return j(handler, {"error": "session_id is required"}, status=400)
         # ?messages=0 skips the message payload for fast session switching.
         # The frontend uses this when switching conversations in the sidebar
         # (only needs metadata). The full message array is loaded lazily
         # via ?messages=1 when the message panel opens.
-        load_messages = parse_qs(parsed.query).get("messages", ["1"])[0] != "0"
+        load_messages = query.get("messages", ["1"])[0] != "0"
+        resolve_model_default = "1" if load_messages else "0"
+        resolve_model = query.get("resolve_model", [resolve_model_default])[0] != "0"
         try:
             _t1 = _time.monotonic()
             s = get_session(sid, metadata_only=(not load_messages))
             _t2 = _time.monotonic()
-            effective_model = _resolve_effective_session_model_for_display(s)
+            effective_model = (
+                _resolve_effective_session_model_for_display(s)
+                if resolve_model
+                else None
+            )
             _t3 = _time.monotonic()
             raw = s.compact() | {
                 "messages": s.messages if load_messages else [],
@@ -735,6 +743,8 @@ def handle_get(handler, parsed) -> bool:
                     "message_count": len(msgs),
                     "created_at": (cli_meta or {}).get("created_at", 0),
                     "updated_at": (cli_meta or {}).get("updated_at", 0),
+                    "last_message_at": (cli_meta or {}).get("last_message_at")
+                    or (cli_meta or {}).get("updated_at", 0),
                     "pinned": False,
                     "archived": False,
                     "project_id": None,
@@ -783,7 +793,10 @@ def handle_get(handler, parsed) -> bool:
         else:
             deduped_cli = []
         merged = webui_sessions + deduped_cli
-        merged.sort(key=lambda s: s.get("updated_at", 0) or 0, reverse=True)
+        merged.sort(
+            key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
+            reverse=True,
+        )
         safe_merged = []
         for s in merged:
             item = dict(s)
@@ -3027,8 +3040,25 @@ def _handle_create_dir(handler, body):
 def _handle_workspace_add(handler, body):
     path_str = body.get("path", "").strip()
     name = body.get("name", "").strip()
+    auto_create = body.get("create", False)
     if not path_str:
         return bad(handler, "path is required")
+    # Validate the path is NOT a blocked system root BEFORE any filesystem mutation.
+    # This prevents creating orphan directories on rejected paths (#782 review).
+    candidate = Path(path_str).expanduser().resolve()
+    for blocked in _workspace_blocked_roots():
+        try:
+            candidate.relative_to(blocked)
+            return bad(handler, f"Path points to a system directory: {candidate}")
+        except ValueError:
+            pass
+    # Now safe to create the directory if requested
+    if auto_create:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            return bad(handler, f"Could not create directory: {_sanitize_error(e)}")
+    # Full validation (exists, is_dir) — should pass now that dir exists
     try:
         p = validate_workspace_to_add(path_str)
     except ValueError as e:
