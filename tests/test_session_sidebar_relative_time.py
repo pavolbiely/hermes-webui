@@ -155,7 +155,10 @@ def test_relative_time_handles_just_now_and_dst_safe_yesterday_boundary():
     assert result["yesterdayBucket"] == "Yesterday"
 
 
-def test_relative_time_strings_are_localized_in_english_and_spanish_bundles():
+def test_relative_time_strings_are_localized_in_en_ru_es_de_zh_bundles():
+    locale_markers = ("en: {", "ru: {", "es: {", "de: {", "zh: {", "'zh-Hant': {")
+    locale_starts = {marker: I18N_JS.index(marker) for marker in locale_markers}
+    ordered_markers = sorted(locale_markers, key=locale_starts.get)
     for key in (
         "session_time_unknown",
         "session_time_minutes_ago",
@@ -169,3 +172,20 @@ def test_relative_time_strings_are_localized_in_english_and_spanish_bundles():
         "session_time_bucket_older",
     ):
         assert key in I18N_JS
+    for idx, marker in enumerate(ordered_markers):
+        start = locale_starts[marker]
+        end = locale_starts[ordered_markers[idx + 1]] if idx + 1 < len(ordered_markers) else None
+        block = I18N_JS[start:end]
+        for key in (
+            "session_time_unknown",
+            "session_time_minutes_ago",
+            "session_time_hours_ago",
+            "session_time_days_ago",
+            "session_time_last_week",
+            "session_time_bucket_today",
+            "session_time_bucket_yesterday",
+            "session_time_bucket_this_week",
+            "session_time_bucket_last_week",
+            "session_time_bucket_older",
+        ):
+            assert key in block, f"{marker} missing {key}"
